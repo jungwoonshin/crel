@@ -1,5 +1,8 @@
 """CREL trainer with cooperative energy training.
 
+Works with any dataset provided by create_data_loaders(), including MEKA-fold
+datasets: bibtex, delicious, genbase (train=folds 1–6, val=7–8, test=9–10).
+
 Per batch:
   1. Update loss-net with contrastive ranking loss (InfoNCE or NCE)
   2. Update task-net with BCE + cooperative energy refinement:

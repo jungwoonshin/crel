@@ -39,7 +39,7 @@ def load_config(path: str) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Train CREL / SEAL models")
     parser.add_argument("--config", type=str, default="configs/version01.yaml")
-    parser.add_argument("--dataset", type=str, default="bibtex", help="Override dataset name")
+    parser.add_argument("--dataset", type=str, default="genbase", help="Override dataset name")
     parser.add_argument("--energy", type=str, default=None, choices=["crel", "seal"])
     parser.add_argument("--rank", type=int, default=None, help="Override CREL rank")
     parser.add_argument("--epochs", type=int, default=None)

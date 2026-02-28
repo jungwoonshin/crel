@@ -241,6 +241,26 @@ def _parse_arff(
 
     num_feature_attrs = total_attrs - num_label_attrs
 
+    # Build per-column converters for nominal attributes (e.g. genbase: protein ID, YES/NO).
+    # Attribute line format: @attribute name type  or  @attribute name {val1, val2, ...}
+    nominal_pattern = re.compile(r"\{([^}]+)\}")
+    converters: list = []  # list of callables str -> float
+    for attr_line in attributes:
+        nominal_match = nominal_pattern.search(attr_line)
+        if nominal_match:
+            choices = [s.strip() for s in nominal_match.group(1).split(",")]
+            # Binary {0,1} or {YES,NO} -> 0.0 / 1.0
+            if set(c.strip().upper() for c in choices) == {"0", "1"}:
+                converters.append(lambda s, m={"0": 0.0, "1": 1.0}: m.get(s.strip(), float("nan")))
+            elif set(c.strip().upper() for c in choices) == {"YES", "NO"}:
+                converters.append(lambda s, m={"YES": 1.0, "NO": 0.0}: m.get(s.strip().upper(), float("nan")))
+            else:
+                # Label encoding for other nominal (e.g. protein ID)
+                value_to_idx = {c: float(i) for i, c in enumerate(choices)}
+                converters.append(lambda s, m=value_to_idx: m.get(s.strip(), float("nan")))
+        else:
+            converters.append(lambda s: float(s))
+
     # Parse data section.
     N = len(data_lines)
     features = np.zeros((N, num_feature_attrs), dtype=np.float64)
@@ -270,9 +290,14 @@ def _parse_arff(
             vals = line.split(",")
             for j, v in enumerate(vals):
                 v = v.strip()
-                if not v:
+                if not v or v == "?":
                     continue
-                fval = float(v)
+                if j < len(converters):
+                    fval = converters[j](v)
+                else:
+                    fval = float(v)
+                if np.isnan(fval):
+                    continue
                 if j < num_feature_attrs:
                     features[i, j] = fval
                 else:
@@ -420,7 +445,8 @@ MEKA_TRAIN_FOLDS = [1, 2, 3, 4, 5, 6]
 MEKA_VAL_FOLDS = [7, 8]
 MEKA_TEST_FOLDS = [9, 10]
 
-# Mapping from dataset name to MEKA fold directory and filename prefix
+# Mapping from dataset name to MEKA fold directory and filename prefix.
+# Supported: bibtex, delicious, genbase (files: {Prefix}-fold1.arff ... in folds_dir).
 MEKA_FOLD_DATASETS: Dict[str, Dict[str, str]] = {
     "bibtex": {
         "folds_dir": "bibtex_stratified10folds_meka",
@@ -429,6 +455,10 @@ MEKA_FOLD_DATASETS: Dict[str, Dict[str, str]] = {
     "delicious": {
         "folds_dir": "delicious-stratified10folds-meka",
         "prefix": "Delicious",
+    },
+    "genbase": {
+        "folds_dir": "genbase-stratified10folds-meka",
+        "prefix": "Genbase",
     },
 }
 
