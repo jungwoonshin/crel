@@ -22,6 +22,7 @@ from crel.models.task_net import TaskNet
 from crel.models.loss_net import LossNet
 from crel.training.trainer import CRELTrainer, TrainerConfig
 from crel.utils.covariance import label_covariance_analysis
+from crel.utils.pretrained import load_seal_pretrained_into_crel
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +49,12 @@ def main():
                         help="Run label covariance analysis before training")
     parser.add_argument("--desc", type=str, default="",
                         help="Experiment description logged to result file")
+    parser.add_argument("--pretrained", type=str, default=None,
+                        help="Path to pretrained checkpoint (SEAL best_model.pt or CREL checkpoint)")
+    parser.add_argument("--bibtex-seal-split", action="store_true",
+                        help="Use SEAL's MEKA fold split for bibtex (train 1-6, val 7-8, test 9-10)")
+    parser.add_argument("--bibtex-folds-dir", type=str, default=None,
+                        help="Path to MEKA fold dir (Bibtex-fold1.arff ...). Default: data_dir/bibtex_stratified10folds_meka")
     args = parser.parse_args()
 
     # Load and override config
@@ -62,6 +69,9 @@ def main():
         cfg["training"]["total_epochs"] = args.epochs
     if args.seed:
         cfg["seed"] = args.seed
+    pretrained_path = args.pretrained or cfg.get("pretrained_path") or None
+    if pretrained_path:
+        cfg["pretrained_path"] = str(Path(pretrained_path).resolve())
 
     # Seed
     seed = cfg.get("seed", 42)
@@ -75,12 +85,17 @@ def main():
     data_dir = cfg["dataset"]["data_dir"]
     batch_size = cfg["training"]["batch_size"]
     num_workers = cfg["dataset"].get("num_workers", 4)
+    bibtex_folds_dir = getattr(args, "bibtex_folds_dir", None) or cfg["dataset"].get("bibtex_folds_dir")
+    if getattr(args, "bibtex_seal_split", False) and dataset_name == "bibtex":
+        bibtex_folds_dir = bibtex_folds_dir or str(Path(data_dir) / "bibtex_stratified10folds_meka")
+        logger.info("Using SEAL bibtex split: %s", bibtex_folds_dir)
 
     loaders = create_data_loaders(
         name=dataset_name,
         data_dir=data_dir,
         batch_size=batch_size,
         num_workers=num_workers,
+        bibtex_folds_dir=bibtex_folds_dir,
     )
 
     train_ds = loaders["train"].dataset
@@ -100,6 +115,28 @@ def main():
         if args.rank is None and energy_type == "crel":
             cfg["energy"]["rank"] = analysis["suggested_rank"]
             logger.info("Auto-setting rank to %d", analysis["suggested_rank"])
+
+    # If using SEAL pretrained (e.g. seal_dynamic_nce best_model.pt), use SEAL-compatible architecture
+    pretrained_ckpt = None
+    if pretrained_path:
+        pretrained_path = str(Path(pretrained_path).resolve())
+        if not Path(pretrained_path).is_file():
+            raise FileNotFoundError(f"Pretrained checkpoint not found: {pretrained_path}")
+        pretrained_ckpt = torch.load(pretrained_path, map_location="cpu", weights_only=False)
+        if isinstance(pretrained_ckpt, dict) and "task_nn" in pretrained_ckpt and "score_nn" in pretrained_ckpt:
+            if dataset_name == "bibtex":
+                cfg.setdefault("task_net", {})["hidden_dims"] = [400, 400]
+                cfg.setdefault("feature_net", {})["hidden_dims"] = [400, 400]
+                if energy_type == "seal":
+                    cfg.setdefault("energy", {})["global_hidden_dim"] = 200
+                logger.info(
+                    "SEAL pretrained detected: using hidden_dims [400, 400] and global_hidden_dim 200 for compatibility"
+                )
+            logger.warning(
+                "SEAL pretrained: ensure the checkpoint was trained on the SAME train/val/test split "
+                "as this run (e.g. CREL data/bibtex/train.arff, val.arff, test.arff). "
+                "Using a different split (e.g. MEKA folds 1-6/7-8/9-10) causes train-test leakage and overly optimistic results."
+            )
 
     # Build task-net
     task_net_cfg = cfg["task_net"]
@@ -140,6 +177,24 @@ def main():
         **energy_kwargs,
     )
     logger.info("LossNet params: %d", sum(p.numel() for p in loss_net.parameters()))
+
+    # Load pretrained weights if requested
+    if pretrained_path and isinstance(pretrained_ckpt, dict):
+        device = args.device or cfg.get("device", "cuda")
+        device = torch.device(device if torch.cuda.is_available() else "cpu")
+        ckpt = pretrained_ckpt
+        if "task_nn" in ckpt and "score_nn" in ckpt:
+            load_seal_pretrained_into_crel(pretrained_path, task_net, loss_net, device, ckpt=ckpt)
+            logger.info("Loaded SEAL pretrained weights from %s", pretrained_path)
+        elif "task_net" in ckpt and "loss_net" in ckpt:
+            task_net.load_state_dict(ckpt["task_net"], strict=False)
+            loss_net.load_state_dict(ckpt["loss_net"], strict=False)
+            logger.info("Loaded CREL checkpoint (model weights only) from %s", pretrained_path)
+        else:
+            raise ValueError(
+                f"Unrecognized checkpoint format at {pretrained_path}. "
+                "Expected SEAL (task_nn, score_nn) or CREL (task_net, loss_net)."
+            )
 
     # Build trainer config
     train_cfg = cfg["training"]

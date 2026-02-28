@@ -135,7 +135,10 @@ class MultiLabelDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 
-def _parse_arff(filepath: str) -> Tuple[np.ndarray, np.ndarray, int]:
+def _parse_arff(
+    filepath: str,
+    num_labels_hint: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray, int]:
     """Parse a Mulan-style ARFF file (dense or sparse) into feature and label arrays.
 
     Mulan ARFF files store multi-label data with labels occupying the *last*
@@ -147,6 +150,10 @@ def _parse_arff(filepath: str) -> Tuple[np.ndarray, np.ndarray, int]:
     ----------
     filepath : str
         Path to the ``.arff`` file.
+    num_labels_hint : int, optional
+        If provided, use this as the number of label attributes (e.g. for MEKA
+        fold files like Bibtex-fold1.arff where the filename does not match
+        DATASET_INFO).
 
     Returns
     -------
@@ -203,7 +210,13 @@ def _parse_arff(filepath: str) -> Tuple[np.ndarray, np.ndarray, int]:
     if num_label_attrs == 0 or num_label_attrs == total_attrs:
         # Fallback: heuristic failed (either no binary attrs, or ALL are binary
         # like in Bibtex where features and labels are both {0,1}).
-        if dataset_name in DATASET_INFO:
+        if num_labels_hint is not None:
+            num_label_attrs = num_labels_hint
+            logger.info(
+                "Using num_labels_hint=%d for %s",
+                num_label_attrs, filepath,
+            )
+        elif dataset_name in DATASET_INFO:
             num_label_attrs = DATASET_INFO[dataset_name]["num_labels"]
             logger.info(
                 "Using DATASET_INFO to set num_labels=%d for %s",
@@ -383,8 +396,36 @@ def load_dataset(
 
 
 # ---------------------------------------------------------------------------
-# create_data_loaders
+# MEKA / SEAL fold-based split (e.g. bibtex 10-fold stratified)
 # ---------------------------------------------------------------------------
+
+# SEAL bibtex split: train = folds 1-6, val = 7-8, test = 9-10
+BIBTEX_SEAL_TRAIN_FOLDS = [1, 2, 3, 4, 5, 6]
+BIBTEX_SEAL_VAL_FOLDS = [7, 8]
+BIBTEX_SEAL_TEST_FOLDS = [9, 10]
+
+
+def _load_meka_folds(
+    folds_dir: Path,
+    fold_indices: list[int],
+    num_labels: int,
+) -> MultiLabelDataset:
+    """Load MEKA-style fold ARFFs (e.g. Bibtex-fold1.arff) and return one dataset."""
+    all_features: list[np.ndarray] = []
+    all_labels: list[np.ndarray] = []
+    for fold in fold_indices:
+        path = folds_dir / f"Bibtex-fold{fold}.arff"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"MEKA fold file not found: {path}. "
+                "Use SEAL's data layout (e.g. data/bibtex_stratified10folds_meka/)."
+            )
+        features, labels, _ = _parse_arff(str(path), num_labels_hint=num_labels)
+        all_features.append(features)
+        all_labels.append(labels)
+    features = np.concatenate(all_features, axis=0).astype(np.float32)
+    labels = np.concatenate(all_labels, axis=0).astype(np.float32)
+    return MultiLabelDataset(features, labels)
 
 
 def create_data_loaders(
@@ -392,6 +433,7 @@ def create_data_loaders(
     data_dir: str = "./data",
     batch_size: int = 64,
     num_workers: int = 4,
+    bibtex_folds_dir: Optional[str] = None,
 ) -> Dict[str, Optional[DataLoader]]:
     """Create train / val / test :class:`DataLoader` instances for a dataset.
 
@@ -405,6 +447,9 @@ def create_data_loaders(
         Mini-batch size.
     num_workers : int
         Number of workers for parallel data loading.
+    bibtex_folds_dir : str, optional
+        If set and name is ``'bibtex'``, load SEAL's split from MEKA folds:
+        train = folds 1-6, val = 7-8, test = 9-10 (Bibtex-fold1.arff ... in this dir).
 
     Returns
     -------
@@ -413,6 +458,54 @@ def create_data_loaders(
         ``'val'`` may be ``None`` if no validation split is available.
     """
     loaders: Dict[str, Optional[DataLoader]] = {}
+
+    if name == "bibtex" and bibtex_folds_dir is not None:
+        folds_path = Path(bibtex_folds_dir)
+        info = DATASET_INFO["bibtex"]
+        num_labels = info["num_labels"]
+        logger.info("Loading bibtex from SEAL MEKA folds: %s", folds_path)
+        train_ds = _load_meka_folds(
+            folds_path, BIBTEX_SEAL_TRAIN_FOLDS, num_labels
+        )
+        val_ds = _load_meka_folds(
+            folds_path, BIBTEX_SEAL_VAL_FOLDS, num_labels
+        )
+        test_ds = _load_meka_folds(
+            folds_path, BIBTEX_SEAL_TEST_FOLDS, num_labels
+        )
+        loaders["train"] = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+        loaders["val"] = DataLoader(
+            val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+        loaders["test"] = DataLoader(
+            test_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+        logger.info(
+            "Train: %d samples, %d features, %d labels",
+            len(train_ds),
+            train_ds.input_dim,
+            train_ds.num_labels,
+        )
+        logger.info("Val:   %d samples", len(val_ds))
+        logger.info("Test:  %d samples", len(test_ds))
+        return loaders
 
     # Train split (required).
     train_ds = load_dataset(name, data_dir=data_dir, split="train")

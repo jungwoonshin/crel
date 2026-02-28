@@ -78,5 +78,10 @@ logging:
   log_dir: ./logs
   experiment_name: crel_default
 
+# Pretrained checkpoint (optional)
+# When set to a SEAL best_model.pt path (e.g. from seal-neurips-2022), task_net and loss_net
+# are initialized from it. For bibtex, architecture is auto-set to [400, 400] / global_hidden_dim 200.
+# pretrained_path: null
+
 # Reproducibility
 seed: 42
