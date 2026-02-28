@@ -193,19 +193,22 @@ class DiagnosticTracker:
 def compute_f1_metrics(
     y_pred: torch.Tensor,
     y_true: torch.Tensor,
-    threshold: float = 0.5,
+    threshold: float | torch.Tensor = 0.5,
 ) -> dict[str, float]:
     """Compute multi-label F1 metrics.
 
     Args:
         y_pred: predicted probabilities, shape (N, L).
         y_true: ground truth, shape (N, L).
-        threshold: binarization threshold.
+        threshold: binarization threshold. Scalar or per-label tensor of shape (L,).
 
     Returns:
         dict with 'micro_f1', 'macro_f1', 'sample_f1'.
     """
-    y_binary = (y_pred >= threshold).float()
+    if isinstance(threshold, torch.Tensor):
+        y_binary = (y_pred >= threshold.to(y_pred.device)).float()
+    else:
+        y_binary = (y_pred >= threshold).float()
 
     # Micro F1: compute globally
     tp = (y_binary * y_true).sum().item()
@@ -247,3 +250,45 @@ def compute_f1_metrics(
         "macro_f1": macro_f1,
         "sample_f1": sample_f1,
     }
+
+
+def optimize_thresholds(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    num_candidates: int = 50,
+) -> torch.Tensor:
+    """Find per-label thresholds that maximize micro-F1 on a validation set.
+
+    Uses a grid search over candidate thresholds for each label independently.
+
+    Args:
+        y_pred: predicted probabilities, shape (N, L).
+        y_true: ground truth, shape (N, L).
+        num_candidates: number of threshold candidates to try per label.
+
+    Returns:
+        Optimal per-label thresholds, shape (L,).
+    """
+    L = y_pred.shape[1]
+    thresholds = torch.full((L,), 0.5)
+    candidates = torch.linspace(0.1, 0.9, num_candidates)
+
+    for j in range(L):
+        best_f1 = -1.0
+        best_t = 0.5
+        pj = y_pred[:, j]
+        tj = y_true[:, j]
+
+        for t in candidates:
+            pred_bin = (pj >= t.item()).float()
+            tp = (pred_bin * tj).sum().item()
+            fp = (pred_bin * (1 - tj)).sum().item()
+            fn = ((1 - pred_bin) * tj).sum().item()
+            f1 = 2 * tp / max(2 * tp + fp + fn, 1e-8)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_t = t.item()
+
+        thresholds[j] = best_t
+
+    return thresholds

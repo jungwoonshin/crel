@@ -1,11 +1,10 @@
-"""CREL trainer with SEAL-dynamic minimax protocol.
+"""CREL trainer with alternating optimization.
 
-Implements alternating optimization of loss-net and task-net from step 1,
-matching the SEAL paper's minimax training structure:
+Implements alternating optimization of loss-net and task-net:
 
-  Per batch, for each outer step (num_steps_task_net times):
-    - Inner loop: update loss-net num_steps_loss_net times with NCE
-    - Outer step: update task-net once with -E + BCE
+  Per batch:
+    1. Update loss-net with contrastive ranking loss (InfoNCE or NCE)
+    2. Update task-net with -E + BCE
 
 Energy magnitude is bounded by spectral normalization on the energy
 network — no clamping, ramp-up, or adaptive loss balancing needed.
@@ -22,7 +21,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from crel.losses.nce import NCELoss, compute_log_prob, compute_log_prob_gaussian
+from crel.losses.nce import NCELoss, InfoNCELoss, compute_log_prob, compute_log_prob_gaussian
 from crel.losses.task_loss import TaskLoss
 from crel.training.ema import EMACenter
 from crel.training.sampling import get_sampler
@@ -41,31 +40,27 @@ class TrainerConfig:
     loss_net_lr: float = 1e-3
     weight_decay: float = 1e-5
 
-    # Multi-step minimax (matching SEAL protocol)
-    num_steps_loss_net: int = 12  # inner NCE steps for loss-net per outer step
-    num_steps_task_net: int = 5   # outer task-net steps per batch
-
     # Loss weights
-    lambda_energy: float = 1.0
+    lambda_energy: float = 0.1
     lambda_bce: float = 1.0
 
     # EMA centering
     ema_beta: float = 0.99
     ema_warmup_beta: float = 0.9
-    ema_warmup_fraction: float = 0.05  # fraction of total steps for EMA beta annealing
+    ema_warmup_fraction: float = 0.05
     per_sample_ema: bool = True
 
-    # NCE
+    # Contrastive loss
+    contrastive_loss: str = "infonce"  # "nce" or "infonce"
     nce_samples: int = 32
     nce_sampling: str = "bernoulli"
     nce_gaussian_sigma: float = 0.3
+    infonce_temperature: float = 1.0
+    energy_reg: float = 0.01  # λ_reg * E² regularization on contrastive loss
+    stop_gradient_energy: bool = True  # detach energy in task loss
 
-    # Gradient clipping (task-net only, matching SEAL)
-    grad_clip: float = 10.0
-
-    # LR scheduling
-    lr_patience: int = 5      # epochs without improvement before reducing LR
-    lr_factor: float = 0.5    # factor to reduce LR by
+    # Gradient clipping (both nets)
+    grad_clip: float = 5.0
 
     # Diagnostics
     log_interval: int = 50
@@ -80,11 +75,11 @@ class TrainerConfig:
 
 
 class CRELTrainer:
-    """Trainer implementing SEAL-dynamic minimax optimization.
+    """Trainer implementing alternating optimization for CREL.
 
-    Per batch, runs a nested loop matching the SEAL protocol:
-      - Outer loop (num_steps_task_net): update task-net with -E + BCE
-        - Inner loop (num_steps_loss_net): update loss-net with NCE
+    Per batch:
+      1. Update loss-net with contrastive ranking loss
+      2. Update task-net with -E + BCE (energy optionally stop-gradient)
 
     Manages EMA centering updates, NCE sampling, and diagnostic tracking.
     """
@@ -107,24 +102,21 @@ class CRELTrainer:
         self.val_loader = val_loader
         self.test_loader = test_loader
 
-        # Optimizers (AdamW matching SEAL)
-        self.task_opt = torch.optim.AdamW(
+        # Mixed precision
+        self.use_amp = self.device.type == "cuda"
+        self.task_scaler = torch.amp.GradScaler(device="cuda", enabled=self.use_amp)
+        self.loss_scaler = torch.amp.GradScaler(device="cuda", enabled=self.use_amp)
+
+        # Optimizers
+        self.task_opt = torch.optim.Adam(
             self.task_net.parameters(),
             lr=self.config.task_net_lr,
             weight_decay=self.config.weight_decay,
         )
-        self.loss_opt = torch.optim.AdamW(
+        self.loss_opt = torch.optim.Adam(
             self.loss_net.parameters(),
             lr=self.config.loss_net_lr,
             weight_decay=self.config.weight_decay,
-        )
-
-        # LR scheduler (ReduceOnPlateau on task-net, matching SEAL)
-        self.task_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.task_opt,
-            mode="max",
-            factor=self.config.lr_factor,
-            patience=self.config.lr_patience,
         )
 
         # Losses
@@ -132,7 +124,13 @@ class CRELTrainer:
             lambda_energy=self.config.lambda_energy,
             lambda_bce=self.config.lambda_bce,
         )
-        self.nce_loss_fn = NCELoss(num_samples=self.config.nce_samples)
+        if self.config.contrastive_loss == "infonce":
+            self.contrastive_loss_fn = InfoNCELoss(
+                num_samples=self.config.nce_samples,
+                temperature=self.config.infonce_temperature,
+            )
+        else:
+            self.contrastive_loss_fn = NCELoss(num_samples=self.config.nce_samples)
 
         # Sampling
         self.sampler = get_sampler(self.config.nce_sampling)
@@ -188,18 +186,19 @@ class CRELTrainer:
             f"# --- Configuration ---",
             f"# Device: {self.device}",
             f"# Total epochs: {self.config.total_epochs}",
-            f"# Training protocol: SEAL-dynamic minimax",
-            f"# Steps per batch: {self.config.num_steps_task_net} outer x {self.config.num_steps_loss_net} inner",
+            f"# Training protocol: alternating (1 contrastive + 1 task step per batch)",
             f"# Task-net LR: {self.config.task_net_lr}",
             f"# Loss-net LR: {self.config.loss_net_lr}",
             f"# Lambda energy: {self.config.lambda_energy}",
             f"# Lambda BCE: {self.config.lambda_bce}",
             f"# EMA beta: {self.config.ema_beta}",
+            f"# Contrastive loss: {self.config.contrastive_loss}",
+            f"# InfoNCE temperature: {self.config.infonce_temperature}",
             f"# NCE samples: {self.config.nce_samples}",
-            f"# NCE sampling: {self.config.nce_sampling}",
-            f"# Grad clip (task-net): {self.config.grad_clip}",
-            f"# LR scheduler: ReduceOnPlateau(patience={self.config.lr_patience}, factor={self.config.lr_factor})",
-            f"# Optimizer: AdamW(weight_decay={self.config.weight_decay})",
+            f"# Energy reg: {self.config.energy_reg}",
+            f"# Stop-gradient energy: {self.config.stop_gradient_energy}",
+            f"# Grad clip: {self.config.grad_clip}",
+            f"# Optimizer: Adam(weight_decay={self.config.weight_decay})",
             f"# Energy bounding: spectral normalization on all energy network layers",
             f"#",
             f"# --- Dataset ---",
@@ -252,11 +251,7 @@ class CRELTrainer:
                 test_metrics = self._evaluate(self.test_loader)
                 history["test_f1"].append(test_metrics.get("micro_f1", 0))
 
-            # Step LR scheduler based on validation metric
-            scheduler_metric = val_metrics.get("sample_f1", test_metrics.get("sample_f1", 0))
-            self.task_scheduler.step(scheduler_metric)
             current_lr = self.task_opt.param_groups[0]["lr"]
-
             elapsed = time.time() - train_start
 
             # Console logging
@@ -269,12 +264,12 @@ class CRELTrainer:
             )
             if val_metrics:
                 msg += (
-                    f" | val_instF1={val_metrics.get('sample_f1', 0):.4f}"
+                    f" | val_sF1={val_metrics.get('sample_f1', 0):.4f}"
                     f" micro={val_metrics.get('micro_f1', 0):.4f}"
                 )
             if test_metrics:
                 msg += (
-                    f" | test_instF1={test_metrics.get('sample_f1', 0):.4f}"
+                    f" | test_sF1={test_metrics.get('sample_f1', 0):.4f}"
                     f" micro={test_metrics.get('micro_f1', 0):.4f}"
                 )
             logger.info(msg)
@@ -355,29 +350,29 @@ class CRELTrainer:
                 if marginals.dim() == 1:
                     marginals = marginals.unsqueeze(0).expand(features.shape[0], -1)
 
-        nce_loss_accum = 0.0
-        last_loss_dict = None
+        # Step 1: Update loss-net with contrastive ranking loss
+        with torch.no_grad():
+            y_pred_detached = self.task_net(features)
 
-        # Minimax loop: outer = task-net steps, inner = loss-net steps
-        for _outer in range(self.config.num_steps_task_net):
+        with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+            nce_loss = self._compute_nce_loss(
+                features, labels, y_pred_detached, marginals
+            )
+        self.loss_opt.zero_grad()
+        self.loss_scaler.scale(nce_loss).backward()
+        self.loss_scaler.unscale_(self.loss_opt)
+        nn.utils.clip_grad_norm_(
+            self.loss_net.parameters(), self.config.grad_clip
+        )
+        self.loss_scaler.step(self.loss_opt)
+        self.loss_scaler.update()
 
-            # Get frozen task-net predictions for this outer step
-            with torch.no_grad():
-                y_pred_detached = self.task_net(features)
-
-            # Inner loop: multiple loss-net (NCE) updates
-            for _inner in range(self.config.num_steps_loss_net):
-                nce_loss = self._compute_nce_loss(
-                    features, labels, y_pred_detached, marginals
-                )
-                self.loss_opt.zero_grad()
-                nce_loss.backward()
-                self.loss_opt.step()
-                nce_loss_accum += nce_loss.item()
-
-            # Outer step: update task-net with -E + BCE
+        # Step 2: Update task-net with -E + BCE
+        with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
             y_pred = self.task_net(features)
             energy = self.loss_net(features, y_pred, marginals)
+            if self.config.stop_gradient_energy:
+                energy = energy.detach()
 
             loss_dict = self.task_loss_fn(
                 energy=energy,
@@ -386,25 +381,25 @@ class CRELTrainer:
                 phase="dynamic",
             )
 
-            self.task_opt.zero_grad()
-            loss_dict["total"].backward()
-            nn.utils.clip_grad_norm_(
-                self.task_net.parameters(), self.config.grad_clip
-            )
-            self.task_opt.step()
-            last_loss_dict = loss_dict
+        self.task_opt.zero_grad()
+        self.task_scaler.scale(loss_dict["total"]).backward()
+        self.task_scaler.unscale_(self.task_opt)
+        nn.utils.clip_grad_norm_(
+            self.task_net.parameters(), self.config.grad_clip
+        )
+        self.task_scaler.step(self.task_opt)
+        self.task_scaler.update()
 
         # Update EMA centering with final predictions
         with torch.no_grad():
             final_pred = self.task_net(features)
             self.ema.update(final_pred.detach(), indices)
 
-        total_inner = self.config.num_steps_task_net * self.config.num_steps_loss_net
         metrics = {
-            "total": last_loss_dict["total"].item(),
-            "energy": last_loss_dict["energy"].item(),
-            "bce": last_loss_dict["bce"].item(),
-            "nce": nce_loss_accum / max(total_inner, 1),
+            "total": loss_dict["total"].item(),
+            "energy": loss_dict["energy"].item(),
+            "bce": loss_dict["bce"].item(),
+            "nce": nce_loss.item(),
         }
 
         if self.config.track_diagnostics and self.diagnostics.should_log():
@@ -418,36 +413,58 @@ class CRELTrainer:
         labels: torch.Tensor,
         y_pred: torch.Tensor,
         marginals: torch.Tensor,
+        log_prob_gt: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        energy_gt = self.loss_net(features, labels.float(), marginals)
+        # Compute feature embeddings once
+        input_features = self.loss_net.feature_network(features)
 
+        # Precompute energy cache (label embeddings A for CREL, local scores for SEAL).
+        # These depend only on x, so they are shared across GT and all K negatives.
+        cache = self.loss_net.energy.precompute(input_features)
+
+        # GT energy using precomputed cache (B samples)
+        energy_gt = self.loss_net.energy.energy_from_precomputed(
+            cache, labels.float(), marginals
+        )
+
+        # Sample negatives: (B, K, L)
         neg_samples = self.sampler(y_pred, num_samples=self.config.nce_samples)
-        batch_size = features.shape[0]
-        K = self.config.nce_samples
 
-        features_expanded = features.unsqueeze(1).expand(batch_size, K, -1)
-        features_flat = features_expanded.reshape(batch_size * K, -1)
-        neg_flat = neg_samples.reshape(batch_size * K, -1)
-        marginals_expanded = marginals.unsqueeze(1).expand(batch_size, K, -1)
-        marginals_flat = marginals_expanded.reshape(batch_size * K, -1)
+        # Negative energy using batched einsum — avoids expanding A from (B,L,r) to (B*K,L,r)
+        energy_neg = self.loss_net.energy.energy_neg_from_precomputed(
+            cache, neg_samples, marginals
+        )
 
-        energy_neg_flat = self.loss_net(features_flat, neg_flat, marginals_flat)
-        energy_neg = energy_neg_flat.reshape(batch_size, K)
+        # Energy regularization: penalize large energy magnitudes
+        if self.config.energy_reg > 0:
+            all_energies = torch.cat([energy_gt.unsqueeze(1), energy_neg], dim=1)
+            e_reg = self.config.energy_reg * (all_energies ** 2).mean()
+        else:
+            e_reg = 0.0
 
-        # Use the correct log-prob for the sampling method
+        # InfoNCE uses raw energy scores; NCE needs log-prob correction
+        if self.config.contrastive_loss == "infonce":
+            return self.contrastive_loss_fn(energy_gt, energy_neg) + e_reg
+
+        # NCE: compute log-prob of GT and negatives under proposal
+        if log_prob_gt is None:
+            if self.config.nce_sampling == "gaussian_noise":
+                sigma = self.config.nce_gaussian_sigma
+                log_prob_gt = compute_log_prob_gaussian(labels.float(), y_pred, sigma)
+            else:
+                log_prob_gt = compute_log_prob(labels.float(), y_pred)
+
         if self.config.nce_sampling == "gaussian_noise":
             sigma = self.config.nce_gaussian_sigma
-            log_prob_gt = compute_log_prob_gaussian(labels.float(), y_pred, sigma)
             log_prob_neg = compute_log_prob_gaussian(
                 neg_samples, y_pred.unsqueeze(1).expand_as(neg_samples), sigma
             )
         else:
-            log_prob_gt = compute_log_prob(labels.float(), y_pred)
             log_prob_neg = compute_log_prob(
                 neg_samples, y_pred.unsqueeze(1).expand_as(neg_samples)
             )
 
-        return self.nce_loss_fn(energy_gt, energy_neg, log_prob_gt, log_prob_neg)
+        return self.contrastive_loss_fn(energy_gt, energy_neg, log_prob_gt, log_prob_neg) + e_reg
 
     def _run_diagnostics(
         self,
@@ -506,7 +523,6 @@ class CRELTrainer:
                 "task_opt": self.task_opt.state_dict(),
                 "loss_opt": self.loss_opt.state_dict(),
                 "ema": self.ema.state_dict(),
-                "task_scheduler": self.task_scheduler.state_dict(),
             },
             path,
         )
@@ -519,5 +535,3 @@ class CRELTrainer:
         self.task_opt.load_state_dict(ckpt["task_opt"])
         self.loss_opt.load_state_dict(ckpt["loss_opt"])
         self.ema.load_state_dict(ckpt["ema"])
-        if "task_scheduler" in ckpt:
-            self.task_scheduler.load_state_dict(ckpt["task_scheduler"])

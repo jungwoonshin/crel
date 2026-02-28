@@ -1,7 +1,8 @@
-"""NCE (Noise Contrastive Estimation) ranking loss for energy training.
+"""Contrastive losses for energy-based model training.
 
-Trains the energy network to assign higher energy to ground-truth label
-configurations than to negative samples from the task-net.
+Provides NCE and InfoNCE ranking losses that train the energy network
+to assign higher energy to ground-truth label configurations than to
+negative samples from the task-net.
 """
 
 import torch
@@ -58,6 +59,57 @@ class NCELoss(nn.Module):
         scores = torch.cat([score_gt.unsqueeze(1), score_neg], dim=1)  # (batch, K+1)
 
         # NCE loss: -log softmax at index 0
+        log_probs = F.log_softmax(scores, dim=1)
+        loss = -log_probs[:, 0].mean()
+
+        return loss
+
+
+class InfoNCELoss(nn.Module):
+    """InfoNCE contrastive loss for training the energy network.
+
+    Unlike NCE, InfoNCE uses raw energy as scores without subtracting
+    the proposal log-probability. This makes the loss simpler and avoids
+    the adversarial scaling dynamic where the log-prob correction can
+    amplify instability.
+
+    The loss is:
+        L = -log[ exp(E(x, y⁰)) / Σ_{k=0}^{K} exp(E(x, y^k)) ]
+
+    where y⁰ is the ground truth and y^k are negative samples.
+    """
+
+    def __init__(self, num_samples: int = 32, temperature: float = 1.0):
+        """
+        Args:
+            num_samples: K, number of negative samples.
+            temperature: temperature scaling for the softmax.
+        """
+        super().__init__()
+        self.num_samples = num_samples
+        self.temperature = temperature
+
+    def forward(
+        self,
+        energy_gt: torch.Tensor,
+        energy_neg: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute InfoNCE loss.
+
+        Args:
+            energy_gt: energy of ground truth, shape (batch,).
+            energy_neg: energy of negative samples, shape (batch, K).
+
+        Returns:
+            loss: scalar, mean InfoNCE loss over batch.
+        """
+        # Scores are raw energies (no log-prob correction)
+        scores = torch.cat(
+            [energy_gt.unsqueeze(1), energy_neg], dim=1
+        )  # (batch, K+1)
+        scores = scores / self.temperature
+
+        # InfoNCE: -log softmax at index 0 (ground truth)
         log_probs = F.log_softmax(scores, dim=1)
         loss = -log_probs[:, 0].mean()
 

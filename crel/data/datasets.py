@@ -516,6 +516,7 @@ def create_data_loaders(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=False,
+        persistent_workers=num_workers > 0,
     )
     logger.info(
         "Train: %d samples, %d features, %d labels",
@@ -549,6 +550,7 @@ def create_data_loaders(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=False,
+        persistent_workers=num_workers > 0,
     )
     logger.info("Test:  %d samples", len(test_ds))
 

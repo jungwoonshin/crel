@@ -204,19 +204,19 @@ def main():
         task_net_lr=train_cfg["task_net_lr"],
         loss_net_lr=train_cfg["loss_net_lr"],
         weight_decay=train_cfg.get("weight_decay", 1e-5),
-        num_steps_loss_net=train_cfg.get("num_steps_loss_net", 12),
-        num_steps_task_net=train_cfg.get("num_steps_task_net", 5),
         lambda_energy=train_cfg.get("lambda_energy", 1.0),
         lambda_bce=train_cfg.get("lambda_bce", 1.0),
         ema_beta=train_cfg.get("ema_beta", 0.99),
         ema_warmup_beta=train_cfg.get("ema_warmup_beta", 0.9),
         ema_warmup_fraction=train_cfg.get("ema_warmup_fraction", 0.05),
+        contrastive_loss=train_cfg.get("contrastive_loss", "infonce"),
         nce_samples=train_cfg.get("nce_samples", 32),
         nce_sampling=train_cfg.get("nce_sampling", "bernoulli"),
         nce_gaussian_sigma=train_cfg.get("nce_gaussian_sigma", 0.3),
-        grad_clip=train_cfg.get("grad_clip", 10.0),
-        lr_patience=train_cfg.get("lr_patience", 5),
-        lr_factor=train_cfg.get("lr_factor", 0.5),
+        infonce_temperature=train_cfg.get("infonce_temperature", 1.0),
+        energy_reg=train_cfg.get("energy_reg", 0.01),
+        stop_gradient_energy=train_cfg.get("stop_gradient_energy", True),
+        grad_clip=train_cfg.get("grad_clip", 5.0),
         log_interval=cfg.get("diagnostics", {}).get("log_interval", 50),
         track_diagnostics=True,
         experiment_dir=f"./experiment_result/{dataset_name}_{energy_type}",
@@ -226,9 +226,7 @@ def main():
             f"Rank={energy_kwargs.get('rank', 'N/A')}, "
             f"lambda_energy={train_cfg.get('lambda_energy', 1.0)}, "
             f"lambda_bce={train_cfg.get('lambda_bce', 1.0)}, "
-            f"NCE samples={train_cfg.get('nce_samples', 32)}. "
-            f"SEAL-dynamic minimax: {train_cfg.get('num_steps_task_net', 5)} outer x "
-            f"{train_cfg.get('num_steps_loss_net', 12)} inner steps."
+            f"NCE samples={train_cfg.get('nce_samples', 32)}."
         ),
         device=device,
     )

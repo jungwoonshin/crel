@@ -198,6 +198,114 @@ class CRELEnergy(nn.Module):
         return energy
 
     # ------------------------------------------------------------------
+    # Precompute / batched API (used by NCE training for efficiency)
+    # ------------------------------------------------------------------
+
+    def precompute(self, input_features: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Precompute label embeddings and derived quantities that depend only on x.
+
+        These are shared across the ground-truth label vector and all K negative
+        samples, avoiding redundant computation in the NCE inner loop.
+
+        Parameters
+        ----------
+        input_features : Tensor, shape (batch, d_x)
+
+        Returns
+        -------
+        dict with keys ``'A'`` (batch, L, r) and ``'a_sq'`` (batch, L).
+        """
+        A = self._compute_label_embeddings(input_features)  # (batch, L, r)
+        a_sq = (A * A).sum(dim=-1)  # (batch, L)
+        return {"A": A, "a_sq": a_sq}
+
+    def energy_from_precomputed(
+        self,
+        cache: dict[str, torch.Tensor],
+        y_pred: torch.Tensor,
+        y_marginals: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute energy using precomputed label embeddings A.
+
+        Parameters
+        ----------
+        cache : dict from :meth:`precompute`.
+        y_pred : Tensor, shape (batch, L)
+        y_marginals : Tensor, shape (batch, L)
+
+        Returns
+        -------
+        energy : Tensor, shape (batch,)
+        """
+        A = cache["A"]
+        a_sq = cache["a_sq"]
+        y_bar = y_pred - y_marginals
+
+        z = torch.einsum("blr,bl->br", A, y_bar)
+        z_sq = 0.5 * (z * z).sum(dim=-1)
+        y_bar_sq = y_bar * y_bar
+        diag_correction = 0.5 * (a_sq * y_bar_sq).sum(dim=-1)
+        e_quad = -z_sq + diag_correction
+
+        if self.higher_order:
+            y_pooled = self.higher_proj(y_bar)
+            h = F.softplus(self.higher_linear(y_pooled))
+            e_higher = self.higher_weight(h).squeeze(-1)
+        else:
+            e_higher = torch.zeros(
+                y_pred.size(0), device=y_pred.device, dtype=y_pred.dtype
+            )
+
+        return e_quad + e_higher
+
+    def energy_neg_from_precomputed(
+        self,
+        cache: dict[str, torch.Tensor],
+        neg_samples: torch.Tensor,
+        y_marginals: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute energy for K negative samples per batch element using precomputed A.
+
+        Uses batched einsum to avoid expanding A from (B, L, r) to (B*K, L, r).
+
+        Parameters
+        ----------
+        cache : dict from :meth:`precompute`.
+        neg_samples : Tensor, shape (batch, K, L)
+        y_marginals : Tensor, shape (batch, L)
+
+        Returns
+        -------
+        energy : Tensor, shape (batch, K)
+        """
+        A = cache["A"]      # (B, L, r)
+        a_sq = cache["a_sq"]  # (B, L)
+        y_bar = neg_samples - y_marginals.unsqueeze(1)  # (B, K, L)
+
+        # Quadratic: z_k = A^T y_bar_k
+        z = torch.einsum("blr,bkl->bkr", A, y_bar)  # (B, K, r)
+        z_sq = 0.5 * (z * z).sum(dim=-1)  # (B, K)
+
+        # Diagonal correction
+        y_bar_sq = y_bar * y_bar  # (B, K, L)
+        diag_correction = 0.5 * torch.einsum("bl,bkl->bk", a_sq, y_bar_sq)  # (B, K)
+
+        e_quad = -z_sq + diag_correction  # (B, K)
+
+        if self.higher_order:
+            B, K, L = neg_samples.shape
+            y_bar_flat = y_bar.reshape(B * K, L)
+            y_pooled = self.higher_proj(y_bar_flat)
+            h = F.softplus(self.higher_linear(y_pooled))
+            e_higher = self.higher_weight(h).squeeze(-1).reshape(B, K)
+        else:
+            e_higher = torch.zeros(
+                neg_samples.shape[:2], device=neg_samples.device, dtype=neg_samples.dtype
+            )
+
+        return e_quad + e_higher
+
+    # ------------------------------------------------------------------
     # Diagnostic helpers (NOT used during training)
     # ------------------------------------------------------------------
     def get_label_embeddings(

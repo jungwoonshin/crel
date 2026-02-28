@@ -30,7 +30,7 @@ feature_net:
   hidden_dims: [512, 512]
   dropout: 0.3
 
-# Training (SEAL-dynamic minimax: alternating updates from step 1)
+# Training (alternating updates from step 1)
 training:
   # Optimization
   total_epochs: 100
@@ -38,14 +38,10 @@ training:
   task_net_lr: 1.0e-3
   loss_net_lr: 1.0e-3
   weight_decay: 1.0e-5
-  optimizer: adamw
-
-  # Multi-step minimax (matching SEAL protocol)
-  num_steps_loss_net: 12    # inner NCE steps for loss-net per outer step
-  num_steps_task_net: 5     # outer task-net steps per batch
+  optimizer: adam
 
   # Loss weights
-  lambda_energy: 1.0        # λ_1: weight on energy term in task-net loss
+  lambda_energy: 0.1        # λ_1: weight on energy term in task-net loss
   lambda_bce: 1.0           # λ_2: weight on BCE term in task-net loss
 
   # EMA centering
@@ -53,17 +49,17 @@ training:
   ema_warmup_beta: 0.9      # starting β during warmup (annealed to ema_beta)
   ema_warmup_fraction: 0.05 # fraction of total steps for EMA beta annealing
 
-  # NCE sampling
+  # Contrastive loss
+  contrastive_loss: infonce  # nce or infonce
+  infonce_temperature: 1.0   # temperature scaling (InfoNCE only)
   nce_samples: 32           # K: number of negative samples
   nce_sampling: bernoulli   # bernoulli or gaussian_noise
   nce_gaussian_sigma: 0.3   # σ for gaussian_noise sampling
+  energy_reg: 0.01          # λ_reg: E² regularization on contrastive loss
+  stop_gradient_energy: true # detach energy in task loss (BCE only trains task-net)
 
-  # Gradient clipping (task-net only, matching SEAL)
-  grad_clip: 10.0
-
-  # LR scheduling (ReduceOnPlateau on task-net)
-  lr_patience: 5
-  lr_factor: 0.5
+  # Gradient clipping (both nets)
+  grad_clip: 5.0
 
 # Diagnostics
 diagnostics:

@@ -56,8 +56,9 @@ class TaskLoss(nn.Module):
                 'energy': energy term (scalar)
                 'bce': BCE term (scalar)
         """
-        # BCE loss (always computed)
-        bce = F.binary_cross_entropy(y_pred, y_true, reduction="mean")
+        # BCE loss (always computed). Disable autocast — BCE is unsafe with AMP.
+        with torch.amp.autocast(device_type=y_pred.device.type, enabled=False):
+            bce = F.binary_cross_entropy(y_pred.float(), y_true.float(), reduction="mean")
 
         if phase == "warmup":
             return {

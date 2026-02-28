@@ -78,3 +78,40 @@ class SEALEnergy(nn.Module):
 
         energy = e_local + e_global  # (batch,)
         return energy
+
+    # ------------------------------------------------------------------
+    # Precompute / batched API (used by NCE training for efficiency)
+    # ------------------------------------------------------------------
+
+    def precompute(self, input_features: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Precompute local scores that depend only on x."""
+        scores = self.local_weight(input_features)  # (B, L)
+        return {"scores": scores}
+
+    def energy_from_precomputed(
+        self,
+        cache: dict[str, torch.Tensor],
+        y_pred: torch.Tensor,
+        y_marginals: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute energy using precomputed local scores. Returns (B,)."""
+        scores = cache["scores"]
+        e_local = (y_pred * scores).sum(dim=-1)
+        h = F.softplus(self.global_linear(y_pred))
+        e_global = self.global_weight(h).squeeze(-1)
+        return e_local + e_global
+
+    def energy_neg_from_precomputed(
+        self,
+        cache: dict[str, torch.Tensor],
+        neg_samples: torch.Tensor,
+        y_marginals: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute energy for K negatives using precomputed scores. Returns (B, K)."""
+        scores = cache["scores"]  # (B, L)
+        e_local = torch.einsum("bl,bkl->bk", scores, neg_samples)  # (B, K)
+        B, K, L = neg_samples.shape
+        neg_flat = neg_samples.reshape(B * K, L)
+        h = F.softplus(self.global_linear(neg_flat))
+        e_global = self.global_weight(h).squeeze(-1).reshape(B, K)
+        return e_local + e_global
