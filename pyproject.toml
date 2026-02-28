@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "crel"
+version = "0.1.0"
+description = "Centered Residual Energy Loss for Structured Prediction"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "scikit-learn>=1.2",
+    "pyyaml>=6.0",
+    "tqdm>=4.65",
+    "tensorboard>=2.13",
+    "wandb>=0.15",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+nlp = [
+    "transformers>=4.30",
+]
+
+[tool.setuptools.packages.find]
+include = ["crel*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,82 @@
+# CREL: Default Configuration
+# ============================
+
+# Dataset
+dataset:
+  name: bibtex            # bibtex, delicious, genbase, cal500, eurlex_ev, expr_fun, spo_fun
+  data_dir: ./data
+  num_workers: 4
+
+# Task Network
+task_net:
+  hidden_dims: [512, 512]
+  dropout: 0.3
+  activation: relu
+
+# CREL Energy (Loss Network)
+energy:
+  type: crel               # crel or seal (for baseline comparison)
+  rank: 32                  # r: rank of low-rank precision factorization
+  label_embed_dim: 32       # d_e: label embedding dimension
+  proj_hidden_dim: 64       # d_h: projection MLP hidden dim
+  # Higher-order term
+  higher_order:
+    enabled: true
+    proj_dim: 64            # r': projection dimension for centered predictions
+    hidden_dim: 128         # h': hidden dim of higher-order MLP
+
+# Feature network (shared input encoder for loss-net)
+feature_net:
+  hidden_dims: [512, 512]
+  dropout: 0.3
+
+# Training (SEAL-dynamic minimax: alternating updates from step 1)
+training:
+  # Optimization
+  total_epochs: 100
+  batch_size: 64
+  task_net_lr: 1.0e-3
+  loss_net_lr: 1.0e-3
+  weight_decay: 1.0e-5
+  optimizer: adamw
+
+  # Multi-step minimax (matching SEAL protocol)
+  num_steps_loss_net: 12    # inner NCE steps for loss-net per outer step
+  num_steps_task_net: 5     # outer task-net steps per batch
+
+  # Loss weights
+  lambda_energy: 1.0        # λ_1: weight on energy term in task-net loss
+  lambda_bce: 1.0           # λ_2: weight on BCE term in task-net loss
+
+  # EMA centering
+  ema_beta: 0.99            # β: EMA coefficient for centering target
+  ema_warmup_beta: 0.9      # starting β during warmup (annealed to ema_beta)
+  ema_warmup_fraction: 0.05 # fraction of total steps for EMA beta annealing
+
+  # NCE sampling
+  nce_samples: 32           # K: number of negative samples
+  nce_sampling: bernoulli   # bernoulli or gaussian_noise
+  nce_gaussian_sigma: 0.3   # σ for gaussian_noise sampling
+
+  # Gradient clipping (task-net only, matching SEAL)
+  grad_clip: 10.0
+
+  # LR scheduling (ReduceOnPlateau on task-net)
+  lr_patience: 5
+  lr_factor: 0.5
+
+# Diagnostics
+diagnostics:
+  log_interval: 50          # steps between diagnostic logging
+  gradient_cosine: true     # track gradient orthogonality (Diagnostic 1)
+  precision_alignment: true # track precision alignment (Diagnostic 2)
+  gradient_snr: true        # track gradient signal-to-noise (Diagnostic 3)
+
+# Logging
+logging:
+  backend: tensorboard      # tensorboard or wandb
+  log_dir: ./logs
+  experiment_name: crel_default
+
+# Reproducibility
+seed: 42

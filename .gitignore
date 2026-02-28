@@ -1,0 +1,37 @@
+# Bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build and distribution
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+nosetests.xml
+
+# IDE and tools
+.claude/
+.env
+.venv
+
+# Experiment outputs (optional: remove if you want to track results)
+experiment_result/
+
+# OS
+.DS_Store
+Thumbs.db
