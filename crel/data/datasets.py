@@ -57,8 +57,8 @@ DATASET_INFO: Dict[str, Dict] = {
         "description": "Eurlex-ev (continuous input)",
     },
     "expr_fun": {
-        "num_labels": 540,
-        "input_dim": 651,
+        "num_labels": 500,
+        "input_dim": 561,
         "description": "Expr_FUN (continuous, taxonomy)",
     },
     "spo_fun": {
@@ -166,6 +166,7 @@ def _parse_arff(
     is_sparse = False
     data_lines: list[str] = []
     in_data = False
+    meka_label_count: Optional[int] = None  # from @RELATION "-C -N"
 
     with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
         for raw_line in fh:
@@ -175,7 +176,12 @@ def _parse_arff(
 
             lower = line.lower()
 
-            if lower.startswith("@attribute"):
+            if lower.startswith("@relation"):
+                # MEKA format: @RELATION "name: -C -500" means last 500 attrs are labels
+                meka_match = re.search(r"-C\s+-(\d+)", line)
+                if meka_match:
+                    meka_label_count = int(meka_match.group(1))
+            elif lower.startswith("@attribute"):
                 attributes.append(line)
             elif lower.startswith("@data"):
                 in_data = True
@@ -214,6 +220,12 @@ def _parse_arff(
             num_label_attrs = num_labels_hint
             logger.info(
                 "Using num_labels_hint=%d for %s",
+                num_label_attrs, filepath,
+            )
+        elif meka_label_count is not None:
+            num_label_attrs = meka_label_count
+            logger.info(
+                "Using MEKA @RELATION -C hint: num_labels=%d for %s",
                 num_label_attrs, filepath,
             )
         elif dataset_name in DATASET_INFO:
@@ -356,11 +368,15 @@ def load_dataset(
     # ------------------------------------------------------------------
     # Strategy 2: ARFF
     # ------------------------------------------------------------------
-    arff_candidates = [
-        base_dir / f"{name}_{split}.arff",
-        base_dir / f"{split}.arff",
-        base_dir / f"{name}-{split}.arff",
-    ]
+    # Map "val" -> also try "dev" (common alias in many datasets)
+    split_aliases = [split] + (["dev"] if split == "val" else [])
+    arff_candidates = []
+    for s in split_aliases:
+        arff_candidates.extend([
+            base_dir / f"{name}_{s}.arff",
+            base_dir / f"{s}.arff",
+            base_dir / f"{name}-{s}.arff",
+        ])
     for arff_path in arff_candidates:
         if arff_path.is_file():
             logger.info("Loading ARFF: %s", arff_path)
@@ -400,25 +416,38 @@ def load_dataset(
 # ---------------------------------------------------------------------------
 
 # SEAL bibtex split: train = folds 1-6, val = 7-8, test = 9-10
-BIBTEX_SEAL_TRAIN_FOLDS = [1, 2, 3, 4, 5, 6]
-BIBTEX_SEAL_VAL_FOLDS = [7, 8]
-BIBTEX_SEAL_TEST_FOLDS = [9, 10]
+MEKA_TRAIN_FOLDS = [1, 2, 3, 4, 5, 6]
+MEKA_VAL_FOLDS = [7, 8]
+MEKA_TEST_FOLDS = [9, 10]
+
+# Mapping from dataset name to MEKA fold directory and filename prefix
+MEKA_FOLD_DATASETS: Dict[str, Dict[str, str]] = {
+    "bibtex": {
+        "folds_dir": "bibtex_stratified10folds_meka",
+        "prefix": "Bibtex",
+    },
+    "delicious": {
+        "folds_dir": "delicious-stratified10folds-meka",
+        "prefix": "Delicious",
+    },
+}
 
 
 def _load_meka_folds(
     folds_dir: Path,
     fold_indices: list[int],
     num_labels: int,
+    prefix: str = "Bibtex",
 ) -> MultiLabelDataset:
     """Load MEKA-style fold ARFFs (e.g. Bibtex-fold1.arff) and return one dataset."""
     all_features: list[np.ndarray] = []
     all_labels: list[np.ndarray] = []
     for fold in fold_indices:
-        path = folds_dir / f"Bibtex-fold{fold}.arff"
+        path = folds_dir / f"{prefix}-fold{fold}.arff"
         if not path.is_file():
             raise FileNotFoundError(
                 f"MEKA fold file not found: {path}. "
-                "Use SEAL's data layout (e.g. data/bibtex_stratified10folds_meka/)."
+                f"Expected {prefix}-fold{{N}}.arff in {folds_dir}."
             )
         features, labels, _ = _parse_arff(str(path), num_labels_hint=num_labels)
         all_features.append(features)
@@ -459,20 +488,20 @@ def create_data_loaders(
     """
     loaders: Dict[str, Optional[DataLoader]] = {}
 
-    if name == "bibtex" and bibtex_folds_dir is not None:
-        folds_path = Path(bibtex_folds_dir)
-        info = DATASET_INFO["bibtex"]
+    # Datasets with MEKA 10-fold stratified splits: train=1-6, val=7-8, test=9-10
+    if name in MEKA_FOLD_DATASETS:
+        meka_cfg = MEKA_FOLD_DATASETS[name]
+        if name == "bibtex" and bibtex_folds_dir:
+            folds_path = Path(bibtex_folds_dir)
+        else:
+            folds_path = Path(data_dir) / meka_cfg["folds_dir"]
+        info = DATASET_INFO[name]
         num_labels = info["num_labels"]
-        logger.info("Loading bibtex from SEAL MEKA folds: %s", folds_path)
-        train_ds = _load_meka_folds(
-            folds_path, BIBTEX_SEAL_TRAIN_FOLDS, num_labels
-        )
-        val_ds = _load_meka_folds(
-            folds_path, BIBTEX_SEAL_VAL_FOLDS, num_labels
-        )
-        test_ds = _load_meka_folds(
-            folds_path, BIBTEX_SEAL_TEST_FOLDS, num_labels
-        )
+        prefix = meka_cfg["prefix"]
+        logger.info("Loading %s from MEKA folds: %s", name, folds_path)
+        train_ds = _load_meka_folds(folds_path, MEKA_TRAIN_FOLDS, num_labels, prefix)
+        val_ds = _load_meka_folds(folds_path, MEKA_VAL_FOLDS, num_labels, prefix)
+        test_ds = _load_meka_folds(folds_path, MEKA_TEST_FOLDS, num_labels, prefix)
         loaders["train"] = DataLoader(
             train_ds,
             batch_size=batch_size,

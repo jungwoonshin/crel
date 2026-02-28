@@ -103,13 +103,15 @@ class InfoNCELoss(nn.Module):
         Returns:
             loss: scalar, mean InfoNCE loss over batch.
         """
-        # Scores are raw energies (no log-prob correction)
+        # Scores are raw energies (no log-prob correction). Use float32 and
+        # subtract max before log_softmax to avoid overflow/NaN when energies
+        # are large (e.g. delicious with 983 labels) or under AMP (float16).
         scores = torch.cat(
-            [energy_gt.unsqueeze(1), energy_neg], dim=1
-        )  # (batch, K+1)
+            [energy_gt.unsqueeze(1).float(), energy_neg.float()], dim=1
+        )
         scores = scores / self.temperature
+        scores = scores - scores.max(dim=1, keepdim=True).values
 
-        # InfoNCE: -log softmax at index 0 (ground truth)
         log_probs = F.log_softmax(scores, dim=1)
         loss = -log_probs[:, 0].mean()
 

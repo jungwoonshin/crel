@@ -241,9 +241,18 @@ def compute_f1_metrics(
     r_per_sample = tp_per_sample / true_per_sample.clamp(min=1e-8)
     f1_per_sample = 2 * p_per_sample * r_per_sample / (p_per_sample + r_per_sample).clamp(min=1e-8)
 
-    # Handle samples with no true labels
-    has_labels = true_per_sample > 0
-    sample_f1 = f1_per_sample[has_labels].mean().item() if has_labels.any() else 0.0
+    # Handle edge cases: no true labels AND no predictions → correct empty (F1=1)
+    no_true = true_per_sample == 0
+    no_pred = pred_per_sample == 0
+    correct_empty = no_true & no_pred
+    f1_per_sample[correct_empty] = 1.0
+
+    # Exclude samples with no true labels but with false positive predictions
+    has_labels_or_correct = (true_per_sample > 0) | correct_empty
+    sample_f1 = (
+        f1_per_sample[has_labels_or_correct].mean().item()
+        if has_labels_or_correct.any() else 0.0
+    )
 
     return {
         "micro_f1": micro_f1,

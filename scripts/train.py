@@ -38,8 +38,8 @@ def load_config(path: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Train CREL / SEAL models")
-    parser.add_argument("--config", type=str, default="configs/default.yaml")
-    parser.add_argument("--dataset", type=str, default=None, help="Override dataset name")
+    parser.add_argument("--config", type=str, default="configs/version01.yaml")
+    parser.add_argument("--dataset", type=str, default="bibtex", help="Override dataset name")
     parser.add_argument("--energy", type=str, default=None, choices=["crel", "seal"])
     parser.add_argument("--rank", type=int, default=None, help="Override CREL rank")
     parser.add_argument("--epochs", type=int, default=None)
@@ -51,10 +51,8 @@ def main():
                         help="Experiment description logged to result file")
     parser.add_argument("--pretrained", type=str, default=None,
                         help="Path to pretrained checkpoint (SEAL best_model.pt or CREL checkpoint)")
-    parser.add_argument("--bibtex-seal-split", action="store_true",
-                        help="Use SEAL's MEKA fold split for bibtex (train 1-6, val 7-8, test 9-10)")
     parser.add_argument("--bibtex-folds-dir", type=str, default=None,
-                        help="Path to MEKA fold dir (Bibtex-fold1.arff ...). Default: data_dir/bibtex_stratified10folds_meka")
+                        help="Path to MEKA fold dir (Bibtex-fold1.arff ...). Default: data_dir/bibtex/bibtex_stratified10folds_meka")
     args = parser.parse_args()
 
     # Load and override config
@@ -86,9 +84,6 @@ def main():
     batch_size = cfg["training"]["batch_size"]
     num_workers = cfg["dataset"].get("num_workers", 4)
     bibtex_folds_dir = getattr(args, "bibtex_folds_dir", None) or cfg["dataset"].get("bibtex_folds_dir")
-    if getattr(args, "bibtex_seal_split", False) and dataset_name == "bibtex":
-        bibtex_folds_dir = bibtex_folds_dir or str(Path(data_dir) / "bibtex_stratified10folds_meka")
-        logger.info("Using SEAL bibtex split: %s", bibtex_folds_dir)
 
     loaders = create_data_loaders(
         name=dataset_name,
@@ -215,18 +210,16 @@ def main():
         nce_gaussian_sigma=train_cfg.get("nce_gaussian_sigma", 0.3),
         infonce_temperature=train_cfg.get("infonce_temperature", 1.0),
         energy_reg=train_cfg.get("energy_reg", 0.01),
-        stop_gradient_energy=train_cfg.get("stop_gradient_energy", True),
         grad_clip=train_cfg.get("grad_clip", 5.0),
         log_interval=cfg.get("diagnostics", {}).get("log_interval", 50),
         track_diagnostics=True,
         experiment_dir=f"./experiment_result/{dataset_name}_{energy_type}",
         experiment_description=(
             args.desc or
-            f"CREL training on {dataset_name} dataset with {energy_type} energy. "
+            f"CREL cooperative training on {dataset_name} with {energy_type} energy. "
             f"Rank={energy_kwargs.get('rank', 'N/A')}, "
             f"lambda_energy={train_cfg.get('lambda_energy', 1.0)}, "
-            f"lambda_bce={train_cfg.get('lambda_bce', 1.0)}, "
-            f"NCE samples={train_cfg.get('nce_samples', 32)}."
+            f"lambda_bce={train_cfg.get('lambda_bce', 1.0)}."
         ),
         device=device,
     )

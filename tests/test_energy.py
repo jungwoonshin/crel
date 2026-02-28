@@ -87,7 +87,11 @@ class TestCRELEnergyCorrectness:
     """Test mathematical correctness of the CREL energy."""
 
     def test_olr_matches_brute_force(self, crel_energy_no_higher):
-        """Verify O(Lr) computation matches brute-force O(L²) computation."""
+        """Verify O(Lr) computation matches brute-force O(L²) computation.
+
+        Uses parametrize.cached() to freeze spectral-norm power iteration
+        so that A is identical between the fast path and the brute-force path.
+        """
         torch.manual_seed(42)
         energy = crel_energy_no_higher
 
@@ -96,22 +100,23 @@ class TestCRELEnergyCorrectness:
         mu = torch.rand(2, 20)
         y_bar = y - mu
 
-        # O(Lr) path
-        e_fast = energy(x, y, mu)
+        with torch.nn.utils.parametrize.cached():
+            # O(Lr) path
+            e_fast = energy(x, y, mu)
 
-        # Brute-force O(L²) path
-        A = energy.get_label_embeddings(x)  # (2, 20, 8)
-        for b in range(2):
-            Ab = A[b]  # (20, 8)
-            coupling = Ab @ Ab.t()  # (20, 20)
+            # Brute-force O(L²) path
+            A = energy.get_label_embeddings(x)  # (2, 20, 8)
+            for b in range(2):
+                Ab = A[b]  # (20, 8)
+                coupling = Ab @ Ab.t()  # (20, 20)
 
-            # Zero diagonal for off-diagonal quadratic
-            diag = torch.diag(coupling.diag())
-            off_diag = coupling - diag
+                # Zero diagonal for off-diagonal quadratic
+                diag = torch.diag(coupling.diag())
+                off_diag = coupling - diag
 
-            e_brute = -0.5 * y_bar[b] @ off_diag @ y_bar[b]
-            assert torch.allclose(e_fast[b], e_brute, atol=5e-3), \
-                f"Batch {b}: fast={e_fast[b].item():.6f}, brute={e_brute.item():.6f}"
+                e_brute = -0.5 * y_bar[b] @ off_diag @ y_bar[b]
+                assert torch.allclose(e_fast[b], e_brute, atol=5e-3), \
+                    f"Batch {b}: fast={e_fast[b].item():.6f}, brute={e_brute.item():.6f}"
 
     def test_zero_centered_gives_zero_energy(self, crel_energy_no_higher):
         """When y_pred == marginals, centered prediction is zero → energy is zero."""
@@ -123,30 +128,36 @@ class TestCRELEnergyCorrectness:
         assert torch.allclose(energy, torch.zeros_like(energy), atol=1e-6)
 
     def test_gradient_finite_differences(self, crel_energy):
-        """Verify gradient via finite differences."""
+        """Verify gradient via finite differences.
+
+        Uses parametrize.cached() to freeze spectral-norm power iteration
+        during the FD loop, preventing weight drift across 40+ forward calls.
+        """
         torch.manual_seed(42)
         x = torch.randn(1, 16)
         y = torch.rand(1, 20).requires_grad_(True)
         mu = torch.rand(1, 20)
 
-        # Autograd gradient
-        e = crel_energy(x, y, mu)
-        e.backward()
-        grad_auto = y.grad.clone()
+        # Cache parametrizations so SN weights are frozen for both autograd and FD
+        with torch.nn.utils.parametrize.cached():
+            # Autograd gradient
+            e = crel_energy(x, y, mu)
+            e.backward()
+            grad_auto = y.grad.clone()
 
-        # Finite differences
-        eps = 1e-4
-        grad_fd = torch.zeros_like(y.data)
-        for i in range(20):
-            y_plus = y.data.clone()
-            y_plus[0, i] += eps
-            e_plus = crel_energy(x, y_plus, mu)
+            # Finite differences
+            eps = 1e-4
+            grad_fd = torch.zeros_like(y.data)
+            for i in range(20):
+                y_plus = y.data.clone()
+                y_plus[0, i] += eps
+                e_plus = crel_energy(x, y_plus, mu)
 
-            y_minus = y.data.clone()
-            y_minus[0, i] -= eps
-            e_minus = crel_energy(x, y_minus, mu)
+                y_minus = y.data.clone()
+                y_minus[0, i] -= eps
+                e_minus = crel_energy(x, y_minus, mu)
 
-            grad_fd[0, i] = (e_plus - e_minus) / (2 * eps)
+                grad_fd[0, i] = (e_plus - e_minus) / (2 * eps)
 
         assert torch.allclose(grad_auto, grad_fd, atol=5e-2), \
             f"Max gradient diff: {(grad_auto - grad_fd).abs().max().item():.6f}"

@@ -16,14 +16,14 @@ task_net:
 # CREL Energy (Loss Network)
 energy:
   type: crel               # crel or seal (for baseline comparison)
-  rank: 64                  # r: rank of low-rank precision factorization
-  label_embed_dim: 32       # d_e: label embedding dimension
-  proj_hidden_dim: 64       # d_h: projection MLP hidden dim
+  rank: 512                  # r: rank of low-rank precision factorization
+  label_embed_dim: 512       # d_e: label embedding dimension
+  proj_hidden_dim: 512       # d_h: projection MLP hidden dim
   # Higher-order term
   higher_order:
     enabled: true
-    proj_dim: 64            # r': projection dimension for centered predictions
-    hidden_dim: 128         # h': hidden dim of higher-order MLP
+    proj_dim: 512            # r': projection dimension for centered predictions
+    hidden_dim: 512         # h': hidden dim of higher-order MLP
 
 # Feature network (shared input encoder for loss-net)
 feature_net:
@@ -38,7 +38,7 @@ training:
   task_net_lr: 1.0e-3
   loss_net_lr: 1.0e-3
   weight_decay: 1.0e-5
-  optimizer: adam
+  optimizer: adamW
 
   # Loss weights
   lambda_energy: 1.0        # λ_1: weight on cooperative energy refinement loss
@@ -58,7 +58,7 @@ training:
   energy_reg: 0.01          # λ_reg: E² regularization on contrastive loss
 
   # Gradient clipping (both nets)
-  grad_clip: 5.0
+  grad_clip: 10.0
 
 # Diagnostics
 diagnostics:

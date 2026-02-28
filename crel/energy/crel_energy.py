@@ -4,6 +4,11 @@ Computes a low-rank quadratic energy over centered label predictions,
 optionally augmented with a higher-order softplus term.  The forward
 pass is O(L * r) -- the L x L coupling matrix is never materialized.
 
+Energy is scaled so its magnitude stays O(1) for any L: inside the
+quadratic, z is scaled by 1/L and the diagonal correction by 1/L^2
+so e_quad is O(1) (true L^2 normalization); the final energy is
+(e_quad + e_higher)/L and optionally clamped to [-1e6, 1e6].
+
 All linear layers are spectrally normalized to bound the energy output
 magnitude, preventing NCE scale degeneracy.
 """
@@ -71,13 +76,19 @@ class CRELEnergy(nn.Module):
         self.label_embeddings = nn.Embedding(num_labels, label_embed_dim)
 
         # --- Two-layer projection: [e_i ; g(x)] -> a_i(x) in R^r ---
-        concat_dim = label_embed_dim + input_dim
-        self.proj_w1 = nn.Linear(concat_dim, proj_hidden_dim)
+        # Split W1 into label and feature parts so we never materialize the
+        # (B, L, d_e+d_x) concatenation tensor:
+        #   W1 · [e_i; g(x)] = W1_label · e_i + W1_feat · g(x)
+        # W1_feat · g(x) is (B, d_h), computed once and broadcast to all L labels.
+        # W1_label · e_i is (L, d_h), computed once and broadcast to all B samples.
+        self.proj_w1_label = nn.Linear(label_embed_dim, proj_hidden_dim, bias=False)
+        self.proj_w1_feat = nn.Linear(input_dim, proj_hidden_dim)  # bias lives here
         self.proj_w2 = nn.Linear(proj_hidden_dim, rank)
 
         # --- Higher-order term (optional) ---
         if self.higher_order:
             self.higher_proj = nn.Linear(num_labels, higher_proj_dim, bias=False)
+            self.higher_feat_proj = nn.Linear(input_dim, higher_proj_dim, bias=False)
             self.higher_linear = nn.Linear(higher_proj_dim, higher_hidden_dim)
             self.higher_weight = nn.Linear(higher_hidden_dim, 1, bias=False)
 
@@ -88,25 +99,33 @@ class CRELEnergy(nn.Module):
     def _init_weights(self) -> None:
         """Xavier / Glorot initialisation for all learnable parameters."""
         nn.init.xavier_uniform_(self.label_embeddings.weight)
-        nn.init.xavier_uniform_(self.proj_w1.weight)
-        nn.init.zeros_(self.proj_w1.bias)
+        nn.init.xavier_uniform_(self.proj_w1_label.weight)
+        nn.init.xavier_uniform_(self.proj_w1_feat.weight)
+        nn.init.zeros_(self.proj_w1_feat.bias)
         nn.init.xavier_uniform_(self.proj_w2.weight)
         nn.init.zeros_(self.proj_w2.bias)
 
         if self.higher_order:
             nn.init.xavier_uniform_(self.higher_proj.weight)
+            nn.init.xavier_uniform_(self.higher_feat_proj.weight)
             nn.init.xavier_uniform_(self.higher_linear.weight)
             nn.init.zeros_(self.higher_linear.bias)
             nn.init.xavier_uniform_(self.higher_weight.weight)
 
     def _apply_spectral_norm(self) -> None:
-        """Apply spectral normalization to all layers in the energy network."""
-        self.label_embeddings = _sn(self.label_embeddings)
-        self.proj_w1 = _sn(self.proj_w1)
+        """Apply spectral normalization to projection layers in the energy network.
+
+        Note: label_embeddings is intentionally excluded — spectral norm on an
+        Embedding constrains all L embeddings to a unit-spectral-norm ball, which
+        is too restrictive.  The downstream proj layers already bound the energy.
+        """
+        self.proj_w1_label = _sn(self.proj_w1_label)
+        self.proj_w1_feat = _sn(self.proj_w1_feat)
         self.proj_w2 = _sn(self.proj_w2)
 
         if self.higher_order:
             self.higher_proj = _sn(self.higher_proj)
+            self.higher_feat_proj = _sn(self.higher_feat_proj)
             self.higher_linear = _sn(self.higher_linear)
             self.higher_weight = _sn(self.higher_weight)
 
@@ -118,6 +137,11 @@ class CRELEnergy(nn.Module):
     ) -> torch.Tensor:
         """Compute all L label-conditioned embeddings a_i(x).
 
+        Uses split projection to avoid materializing (B, L, d_e+d_x):
+            W1 · [e_i; g(x)] = W1_label · e_i  +  W1_feat · g(x)
+        The feature term is (B, d_h) computed once and broadcast; the label
+        term is (L, d_h) computed once and broadcast.  Their sum is (B, L, d_h).
+
         Parameters
         ----------
         input_features : Tensor, shape (batch, d_x)
@@ -125,23 +149,21 @@ class CRELEnergy(nn.Module):
         Returns
         -------
         A : Tensor, shape (batch, L, r)
-            A[b, i, :] = a_i(x_b) = W2 * ReLU(W1 * [e_i ; g(x_b)])
         """
-        batch_size = input_features.size(0)
-
         label_indices = torch.arange(
             self.num_labels, device=input_features.device
         )
         e = self.label_embeddings(label_indices)  # (L, d_e)
 
-        e_expanded = e.unsqueeze(0).expand(batch_size, -1, -1)
-        g_expanded = input_features.unsqueeze(1).expand(-1, self.num_labels, -1)
+        # (L, d_h) — label part, broadcast over batch
+        h_label = self.proj_w1_label(e)            # (L, d_h)
+        # (B, d_h) — feature part (includes bias), broadcast over labels
+        h_feat = self.proj_w1_feat(input_features)  # (B, d_h)
 
-        concat = torch.cat([e_expanded, g_expanded], dim=-1)
+        # (B, L, d_h) via broadcast addition — no (B, L, d_e+d_x) tensor
+        hidden = F.relu(h_label.unsqueeze(0) + h_feat.unsqueeze(1))
 
-        hidden = F.relu(self.proj_w1(concat))   # (batch, L, d_h)
-        A = self.proj_w2(hidden)                 # (batch, L, r)
-
+        A = self.proj_w2(hidden)  # (B, L, r)
         return A
 
     # ------------------------------------------------------------------
@@ -174,27 +196,31 @@ class CRELEnergy(nn.Module):
         A = self._compute_label_embeddings(input_features)  # (batch, L, r)
 
         # Quadratic energy (O(Lr), never form L x L matrix)
-        z = torch.einsum("blr,bl->br", A, y_bar)  # (batch, r)
+        # Scale z by 1/L and diag by 1/L^2 so e_quad is O(1) and does not overflow for large L.
+        L = self.num_labels
+        z = torch.einsum("blr,bl->br", A, y_bar) / L  # (batch, r)
         z_sq = 0.5 * (z * z).sum(dim=-1)  # (batch,)
 
-        # Diagonal correction
+        # Diagonal correction (scale by 1/L^2 to match quadratic)
         a_sq = (A * A).sum(dim=-1)               # (batch, L)
         y_bar_sq = y_bar * y_bar                  # (batch, L)
-        diag_correction = 0.5 * (a_sq * y_bar_sq).sum(dim=-1)  # (batch,)
+        diag_correction = (0.5 * (a_sq * y_bar_sq).sum(dim=-1)) / (L * L)  # (batch,)
 
         e_quad = -z_sq + diag_correction  # (batch,)
 
-        # Higher-order energy (optional)
+        # Higher-order energy (optional, input-conditioned)
         if self.higher_order:
-            y_pooled = self.higher_proj(y_bar)              # (batch, r')
-            h = F.softplus(self.higher_linear(y_pooled))    # (batch, h')
-            e_higher = self.higher_weight(h).squeeze(-1)    # (batch,)
+            y_pooled = self.higher_proj(y_bar)                     # (batch, r')
+            f_pooled = self.higher_feat_proj(input_features)       # (batch, r')
+            h = F.softplus(self.higher_linear(y_pooled + f_pooled))  # (batch, h')
+            e_higher = self.higher_weight(h).squeeze(-1)           # (batch,)
         else:
             e_higher = torch.zeros(
                 y_pred.size(0), device=y_pred.device, dtype=y_pred.dtype
             )
 
         energy = e_quad + e_higher  # (batch,)
+        energy = (energy / self.num_labels).clamp(-1e6, 1e6)
         return energy
 
     # ------------------------------------------------------------------
@@ -213,11 +239,15 @@ class CRELEnergy(nn.Module):
 
         Returns
         -------
-        dict with keys ``'A'`` (batch, L, r) and ``'a_sq'`` (batch, L).
+        dict with keys ``'A'`` (batch, L, r), ``'a_sq'`` (batch, L),
+        and ``'f_pooled'`` (batch, r') if higher_order is enabled.
         """
         A = self._compute_label_embeddings(input_features)  # (batch, L, r)
         a_sq = (A * A).sum(dim=-1)  # (batch, L)
-        return {"A": A, "a_sq": a_sq}
+        cache = {"A": A, "a_sq": a_sq}
+        if self.higher_order:
+            cache["f_pooled"] = self.higher_feat_proj(input_features)  # (batch, r')
+        return cache
 
     def energy_from_precomputed(
         self,
@@ -241,22 +271,24 @@ class CRELEnergy(nn.Module):
         a_sq = cache["a_sq"]
         y_bar = y_pred - y_marginals
 
-        z = torch.einsum("blr,bl->br", A, y_bar)
+        L = self.num_labels
+        z = torch.einsum("blr,bl->br", A, y_bar) / L
         z_sq = 0.5 * (z * z).sum(dim=-1)
         y_bar_sq = y_bar * y_bar
-        diag_correction = 0.5 * (a_sq * y_bar_sq).sum(dim=-1)
+        diag_correction = (0.5 * (a_sq * y_bar_sq).sum(dim=-1)) / (L * L)
         e_quad = -z_sq + diag_correction
 
         if self.higher_order:
             y_pooled = self.higher_proj(y_bar)
-            h = F.softplus(self.higher_linear(y_pooled))
+            f_pooled = cache["f_pooled"]
+            h = F.softplus(self.higher_linear(y_pooled + f_pooled))
             e_higher = self.higher_weight(h).squeeze(-1)
         else:
             e_higher = torch.zeros(
                 y_pred.size(0), device=y_pred.device, dtype=y_pred.dtype
             )
 
-        return e_quad + e_higher
+        return ((e_quad + e_higher) / self.num_labels).clamp(-1e6, 1e6)
 
     def energy_neg_from_precomputed(
         self,
@@ -282,28 +314,31 @@ class CRELEnergy(nn.Module):
         a_sq = cache["a_sq"]  # (B, L)
         y_bar = neg_samples - y_marginals.unsqueeze(1)  # (B, K, L)
 
-        # Quadratic: z_k = A^T y_bar_k
-        z = torch.einsum("blr,bkl->bkr", A, y_bar)  # (B, K, r)
+        L = self.num_labels
+        # Quadratic: z_k = A^T y_bar_k, scaled by 1/L
+        z = torch.einsum("blr,bkl->bkr", A, y_bar) / L  # (B, K, r)
         z_sq = 0.5 * (z * z).sum(dim=-1)  # (B, K)
 
-        # Diagonal correction
+        # Diagonal correction (scale by 1/L^2)
         y_bar_sq = y_bar * y_bar  # (B, K, L)
-        diag_correction = 0.5 * torch.einsum("bl,bkl->bk", a_sq, y_bar_sq)  # (B, K)
+        diag_correction = (0.5 * torch.einsum("bl,bkl->bk", a_sq, y_bar_sq)) / (L * L)  # (B, K)
 
         e_quad = -z_sq + diag_correction  # (B, K)
 
         if self.higher_order:
             B, K, L = neg_samples.shape
             y_bar_flat = y_bar.reshape(B * K, L)
-            y_pooled = self.higher_proj(y_bar_flat)
-            h = F.softplus(self.higher_linear(y_pooled))
+            y_pooled = self.higher_proj(y_bar_flat)          # (B*K, r')
+            f_pooled = cache["f_pooled"]                     # (B, r')
+            f_expanded = f_pooled.unsqueeze(1).expand(B, K, -1).reshape(B * K, -1)
+            h = F.softplus(self.higher_linear(y_pooled + f_expanded))
             e_higher = self.higher_weight(h).squeeze(-1).reshape(B, K)
         else:
             e_higher = torch.zeros(
                 neg_samples.shape[:2], device=neg_samples.device, dtype=neg_samples.dtype
             )
 
-        return e_quad + e_higher
+        return ((e_quad + e_higher) / self.num_labels).clamp(-1e6, 1e6)
 
     # ------------------------------------------------------------------
     # Diagnostic helpers (NOT used during training)
