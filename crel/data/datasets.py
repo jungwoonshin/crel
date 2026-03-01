@@ -397,7 +397,10 @@ def load_dataset(
     split_aliases = [split] + (["dev"] if split == "val" else [])
     arff_candidates = []
     for s in split_aliases:
+        # Prefer normalized versions (e.g. train-normalized.arff) for continuous datasets
         arff_candidates.extend([
+            base_dir / f"{s}-normalized.arff",
+            base_dir / f"{name}_{s}-normalized.arff",
             base_dir / f"{name}_{s}.arff",
             base_dir / f"{s}.arff",
             base_dir / f"{name}-{s}.arff",

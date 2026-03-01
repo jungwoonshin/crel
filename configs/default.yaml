@@ -41,7 +41,6 @@ training:
   optimizer: adam
 
   # Loss weights
-  lambda_energy: 1.0        # λ_1: weight on cooperative energy refinement loss
   lambda_bce: 1.0           # λ_2: weight on BCE term
 
   # EMA centering
@@ -53,9 +52,8 @@ training:
   contrastive_loss: infonce  # nce or infonce
   infonce_temperature: 1.0   # temperature scaling (InfoNCE only)
   nce_samples: 32           # K: number of negative samples
-  nce_sampling: bernoulli   # bernoulli or gaussian_noise
+  nce_sampling: corruption    # corruption, bernoulli, adversarial, or gaussian_noise
   nce_gaussian_sigma: 0.3   # σ for gaussian_noise sampling
-  energy_reg: 0.01          # λ_reg: E² regularization on contrastive loss
 
   # Gradient clipping (both nets)
   grad_clip: 5.0

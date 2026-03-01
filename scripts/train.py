@@ -38,8 +38,8 @@ def load_config(path: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Train CREL / SEAL models")
-    parser.add_argument("--config", type=str, default="configs/version01.yaml")
-    parser.add_argument("--dataset", type=str, default="genbase", help="Override dataset name")
+    parser.add_argument("--config", type=str, default="configs/version02.yaml")
+    parser.add_argument("--dataset", type=str, default="expr_fun", help="Override dataset name")
     parser.add_argument("--energy", type=str, default=None, choices=["crel", "seal"])
     parser.add_argument("--rank", type=int, default=None, help="Override CREL rank")
     parser.add_argument("--epochs", type=int, default=None)
@@ -199,7 +199,6 @@ def main():
         task_net_lr=train_cfg["task_net_lr"],
         loss_net_lr=train_cfg["loss_net_lr"],
         weight_decay=train_cfg.get("weight_decay", 1e-5),
-        lambda_energy=train_cfg.get("lambda_energy", 1.0),
         lambda_bce=train_cfg.get("lambda_bce", 1.0),
         ema_beta=train_cfg.get("ema_beta", 0.99),
         ema_warmup_beta=train_cfg.get("ema_warmup_beta", 0.9),
@@ -209,7 +208,7 @@ def main():
         nce_sampling=train_cfg.get("nce_sampling", "bernoulli"),
         nce_gaussian_sigma=train_cfg.get("nce_gaussian_sigma", 0.3),
         infonce_temperature=train_cfg.get("infonce_temperature", 1.0),
-        energy_reg=train_cfg.get("energy_reg", 0.01),
+        coop_step_size=train_cfg.get("coop_step_size", 0.5),
         grad_clip=train_cfg.get("grad_clip", 5.0),
         log_interval=cfg.get("diagnostics", {}).get("log_interval", 50),
         track_diagnostics=True,
@@ -218,7 +217,6 @@ def main():
             args.desc or
             f"CREL cooperative training on {dataset_name} with {energy_type} energy. "
             f"Rank={energy_kwargs.get('rank', 'N/A')}, "
-            f"lambda_energy={train_cfg.get('lambda_energy', 1.0)}, "
             f"lambda_bce={train_cfg.get('lambda_bce', 1.0)}."
         ),
         device=device,
@@ -253,7 +251,7 @@ def main():
             f"EXPERIMENT COMPLETE: {dataset_name} / {energy_type}\n"
             f"  Final test micro_F1: {final_test_f1:.4f}\n"
             f"  Best test micro_F1:  {best_test_f1:.4f} (epoch {best_epoch})\n"
-            f"  Results logged to:   experiment_result/{dataset_name}_{energy_type}/epoch_results.txt\n"
+            f"  Results logged to:   experiment_result/{dataset_name}_{energy_type}/epoch_results.tsv\n"
             f"{'='*60}"
         )
         logger.info(summary)

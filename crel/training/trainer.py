@@ -1,15 +1,10 @@
-"""CREL trainer with cooperative energy training.
-
-Works with any dataset provided by create_data_loaders(), including MEKA-fold
-datasets: bibtex, delicious, genbase (train=folds 1–6, val=7–8, test=9–10).
+"""CREL trainer: alternating energy + task-net training.
 
 Per batch:
   1. Update loss-net with contrastive ranking loss (InfoNCE or NCE)
-  2. Update task-net with BCE + cooperative energy refinement:
-     - Compute energy-refined target via gradient ascent on E(x,y) w.r.t. y
-     - Train task-net to match refined target with MSE
+  2. Update task-net with BCE
 
-Both networks agree on the direction — no adversarial instability.
+At inference, gradient ascent on the learned energy refines task-net predictions.
 """
 
 import logging
@@ -22,7 +17,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -45,7 +40,6 @@ class TrainerConfig:
     weight_decay: float = 1e-5
 
     # Loss weights
-    lambda_energy: float = 1.0  # weight on cooperative energy refinement loss
     lambda_bce: float = 1.0
 
     # EMA centering
@@ -57,13 +51,14 @@ class TrainerConfig:
     # Contrastive loss
     contrastive_loss: str = "infonce"  # "nce" or "infonce"
     nce_samples: int = 32
-    nce_sampling: str = "bernoulli"
+    nce_sampling: str = "adversarial"
     nce_gaussian_sigma: float = 0.3
     infonce_temperature: float = 1.0
-    energy_reg: float = 0.01  # λ_reg * E² regularization on contrastive loss
 
-    # Inference-time energy refinement
-    refinement_steps: int = 5
+    # Inference-time energy refinement via gradient ascent on learned energy.
+    # The energy network (trained by InfoNCE) captures label correlations;
+    # refinement uses its gradients to improve task-net predictions at eval time.
+    refinement_steps: int = 3
     refinement_step_size: float = 0.1
 
     # Gradient clipping (both nets)
@@ -82,12 +77,13 @@ class TrainerConfig:
 
 
 class CRELTrainer:
-    """Trainer implementing cooperative energy training for CREL.
+    """Trainer for CREL: alternating energy + task-net training.
 
     Per batch:
-      1. Update loss-net with contrastive ranking loss
-      2. Compute energy-refined target: ŷ_ref = clamp(ŷ + ∇_ŷ E, 0, 1)
-      3. Update task-net with BCE(ŷ,y) + λ_E·MSE(ŷ, ŷ_ref)
+      1. Update loss-net with InfoNCE/NCE ranking loss
+      2. Update task-net with BCE
+
+    At eval time, gradient ascent on the learned energy refines predictions.
     """
 
     def __init__(
@@ -125,19 +121,14 @@ class CRELTrainer:
             weight_decay=self.config.weight_decay,
         )
 
-        # Cosine annealing LR schedulers
-        # Filter harmless PyTorch warning about scheduler.step() ordering.
-        # Our schedulers step after _train_epoch which calls optimizer.step().
-        warnings.filterwarnings("ignore", "Detected call of `lr_scheduler.step\\(\\)` before")
-        self.task_scheduler = CosineAnnealingLR(
-            self.task_opt,
-            T_max=self.config.total_epochs,
-            eta_min=self.config.task_net_lr * 0.01,
+        # ReduceLROnPlateau: reduce LR when val sample_f1 stops improving
+        self.task_scheduler = ReduceLROnPlateau(
+            self.task_opt, mode="max", factor=0.5, patience=5,
+            min_lr=self.config.task_net_lr * 0.01,
         )
-        self.loss_scheduler = CosineAnnealingLR(
-            self.loss_opt,
-            T_max=self.config.total_epochs,
-            eta_min=self.config.loss_net_lr * 0.01,
+        self.loss_scheduler = ReduceLROnPlateau(
+            self.loss_opt, mode="max", factor=0.5, patience=5,
+            min_lr=self.config.loss_net_lr * 0.01,
         )
 
         # Contrastive loss for loss-net
@@ -149,8 +140,13 @@ class CRELTrainer:
         else:
             self.contrastive_loss_fn = NCELoss(num_samples=self.config.nce_samples)
 
-        # Sampling
-        self.sampler = get_sampler(self.config.nce_sampling)
+        # Sampling (adversarial is handled in _sample_adversarial, not via sampler)
+        self.sampler = None
+        if self.config.nce_sampling != "adversarial":
+            self.sampler = get_sampler(self.config.nce_sampling)
+            if self.config.nce_sampling == "gaussian_noise":
+                from functools import partial
+                self.sampler = partial(self.sampler, sigma=self.config.nce_gaussian_sigma)
 
         # EMA centering
         dataset_size = len(train_loader.dataset)
@@ -186,7 +182,7 @@ class CRELTrainer:
             exp_dir = Path(self.config.experiment_dir)
             exp_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            exp_path = exp_dir / f"epoch_results_{timestamp}.txt"
+            exp_path = exp_dir / f"epoch_results_{timestamp}.tsv"
             self._exp_path = exp_path
             self._exp_file = open(exp_path, "w", encoding="utf-8")
             self._write_experiment_header(timestamp)
@@ -211,13 +207,11 @@ class CRELTrainer:
             f"# Training protocol: cooperative energy refinement",
             f"# Task-net LR: {self.config.task_net_lr}",
             f"# Loss-net LR: {self.config.loss_net_lr}",
-            f"# Lambda energy (coop): {self.config.lambda_energy}",
             f"# Lambda BCE: {self.config.lambda_bce}",
             f"# EMA beta: {self.config.ema_beta}",
             f"# Contrastive loss: {self.config.contrastive_loss}",
             f"# InfoNCE temperature: {self.config.infonce_temperature}",
             f"# NCE samples: {self.config.nce_samples}",
-            f"# Energy reg: {self.config.energy_reg}",
             f"# Grad clip: {self.config.grad_clip}",
             f"# Optimizer: AdamW(weight_decay={self.config.weight_decay})",
             f"# LR scheduler: CosineAnnealing(T_max={self.config.total_epochs})",
@@ -266,10 +260,6 @@ class CRELTrainer:
             train_metrics = self._train_epoch(epoch)
             history["train_loss"].append(train_metrics["total_loss"])
 
-            # Step LR schedulers
-            self.task_scheduler.step()
-            self.loss_scheduler.step()
-
             # Evaluate with threshold optimization on val, applied to test
             val_metrics = {}
             val_thresholds = 0.5
@@ -283,9 +273,14 @@ class CRELTrainer:
                 test_metrics = self._evaluate(self.test_loader, threshold=val_thresholds)
                 history["test_f1"].append(test_metrics.get("micro_f1", 0))
 
+            # Step LR schedulers on val sample_f1
+            val_sample_f1 = val_metrics.get("sample_f1", 0)
+            self.task_scheduler.step(val_sample_f1)
+            self.loss_scheduler.step(val_sample_f1)
+
             # Best model tracking on val sample_f1
             if val_metrics:
-                current_metric = val_metrics.get("sample_f1", 0)
+                current_metric = val_sample_f1
                 if current_metric > self.best_val_metric:
                     self.best_val_metric = current_metric
                     self.best_epoch = epoch + 1
@@ -303,6 +298,7 @@ class CRELTrainer:
                 f"loss={train_metrics['total_loss']:.4f}"
                 f" bce={train_metrics['bce_loss']:.4f}"
                 f" coop={train_metrics['coop_loss']:.4f}"
+                f" nce={train_metrics['nce_loss']:.4f}"
                 f" lr={current_lr:.1e}"
             )
             if val_metrics:
@@ -452,16 +448,12 @@ class CRELTrainer:
                     y_pred.float(), labels.float(), reduction="mean"
                 )
 
-            # Cooperative energy refinement: one gradient ascent step on E w.r.t. y
-            y_refined = self._compute_cooperative_target(
-                features, y_pred, marginals
+            # Cooperative refinement: push task-net toward energy-favored predictions.
+            coop_loss = self._compute_coop_loss(
+                y_pred, features, marginals,
             )
-            coop_loss = F.mse_loss(y_pred.float(), y_refined)
 
-            total_loss = (
-                self.config.lambda_bce * bce_loss
-                + self.config.lambda_energy * coop_loss
-            )
+            total_loss = self.config.lambda_bce * bce_loss + coop_loss
 
         self.task_opt.zero_grad()
         self.task_scaler.scale(total_loss).backward()
@@ -489,38 +481,62 @@ class CRELTrainer:
 
         return metrics
 
-    def _compute_cooperative_target(
+
+    def _compute_coop_loss(
         self,
-        features: torch.Tensor,
         y_pred: torch.Tensor,
+        features: torch.Tensor,
         marginals: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute energy-refined prediction target via one gradient ascent step.
-
-        ŷ_ref = clamp(ŷ + ∇_ŷ E(x, ŷ), 0, 1)
-
-        The energy gradient tells the task-net which direction makes predictions
-        more GT-like according to the energy function. Uses precomputed cache
-        and torch.autograd.grad (no grad flow to loss-net params).
-
-        Returns:
-            y_refined: detached refined target, shape (batch, L).
-        """
+        """MSE toward energy-refined target (unclamped, raw gradient)."""
         y = y_pred.detach().float().requires_grad_(True)
-
-        # Precompute input-dependent cache (shared, does not depend on y)
         with torch.no_grad():
-            input_features = self.loss_net.feature_network(features)
-            cache = self.loss_net.energy.precompute(input_features)
-
-        energy = self.loss_net.energy.energy_from_precomputed(
-            cache, y, marginals.detach()
-        )
-        # Gradient of energy w.r.t. y only (not loss-net params)
+            feat = self.loss_net.feature_network(features)
+            cache = self.loss_net.energy.precompute(feat)
+        energy = self.loss_net.energy.energy_from_precomputed(cache, y, marginals.detach())
         grad_y = torch.autograd.grad(energy.sum(), y)[0]
-        y_refined = (y.detach() + grad_y).clamp(0, 1)
+        y_ref = y + self.config.coop_step_size * grad_y
+        return F.mse_loss(y_pred, y_ref.detach())
 
-        return y_refined.detach()
+    def _sample_adversarial(
+        self,
+        cache: dict[str, torch.Tensor],
+        labels: torch.Tensor,
+        marginals: torch.Tensor,
+        num_samples: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generate adversarial negatives via gradient ascent on energy.
+
+        Starts from GT + noise, then takes one gradient ascent step to find
+        high-energy configurations that the energy network currently cannot
+        distinguish from ground truth. Returns both samples and their energies
+        (since energy is already computed during the ascent step).
+        """
+        B, L = labels.shape
+        # K diverse starting points: GT + Gaussian noise
+        gt = labels.float().unsqueeze(1).expand(B, num_samples, L)
+        noise = torch.randn_like(gt) * 0.3
+        y = (gt + noise).clamp(0, 1).detach().requires_grad_(True)
+
+        # Freeze energy params — only compute gradient w.r.t. y
+        for p in self.loss_net.energy.parameters():
+            p.requires_grad_(False)
+        energy = self.loss_net.energy.energy_neg_from_precomputed(
+            cache, y, marginals
+        )
+        grad_y = torch.autograd.grad(energy.sum(), y)[0]
+        for p in self.loss_net.energy.parameters():
+            p.requires_grad_(True)
+
+        # Ascent: move toward higher energy (harder negatives)
+        y_adv = (y.detach() + self.config.refinement_step_size * grad_y).clamp(0, 1)
+        neg_samples = y_adv.detach()
+
+        # Recompute energy for the final adversarial samples (with grad for NCE)
+        energy_neg = self.loss_net.energy.energy_neg_from_precomputed(
+            cache, neg_samples, marginals
+        )
+        return neg_samples, energy_neg
 
     def _compute_nce_loss(
         self,
@@ -542,55 +558,20 @@ class CRELTrainer:
         )
 
         # Sample negatives: (B, K, L)
-        neg_samples = self.sampler(y_pred, num_samples=self.config.nce_samples)
-
-        # Negative energy using batched einsum
-        energy_neg = self.loss_net.energy.energy_neg_from_precomputed(
-            cache, neg_samples, marginals
-        )
-
-        # --- Root-cause diagnostic: log once on first few steps ---
-        if self.global_step < 3:
-            def _stats(t: torch.Tensor, name: str) -> None:
-                with torch.no_grad():
-                    t = t.float()
-                    nan_c = torch.isnan(t).sum().item()
-                    inf_c = torch.isinf(t).sum().item()
-                    ok = t[~(torch.isnan(t) | torch.isinf(t))]
-                    if ok.numel() > 0:
-                        logger.info(
-                            "[nce_diagnostic] %s: min=%.4f max=%.4f mean=%.4f nan=%d inf=%d",
-                            name, ok.min().item(), ok.max().item(), ok.mean().item(), nan_c, inf_c,
-                        )
-                    else:
-                        logger.info("[nce_diagnostic] %s: all nan/inf (nan=%d inf=%d)", name, nan_c, inf_c)
-            _stats(input_features, "input_features")
-            _stats(energy_gt, "energy_gt")
-            _stats(energy_neg, "energy_neg")
-            with torch.no_grad():
-                infonce_only = self.contrastive_loss_fn(energy_gt, energy_neg)
-                logger.info("[nce_diagnostic] infonce_loss (no e_reg)=%.6f", infonce_only.item())
-
-        # Energy regularization
-        if self.config.energy_reg > 0:
-            all_energies = torch.cat([energy_gt.unsqueeze(1), energy_neg], dim=1)
-            e_reg = self.config.energy_reg * (all_energies ** 2).mean()
+        if self.config.nce_sampling == "adversarial":
+            neg_samples, energy_neg = self._sample_adversarial(
+                cache, labels, marginals, self.config.nce_samples
+            )
         else:
-            e_reg = 0.0
-
-        if self.global_step < 3:
-            with torch.no_grad():
-                if isinstance(e_reg, torch.Tensor):
-                    logger.info("[nce_diagnostic] e_reg=%.6f", e_reg.item())
-                else:
-                    logger.info("[nce_diagnostic] e_reg=%.6f", float(e_reg))
-                total_nce = self.contrastive_loss_fn(energy_gt, energy_neg)
-                total_nce = total_nce + (e_reg if isinstance(e_reg, torch.Tensor) else 0.0)
-                logger.info("[nce_diagnostic] total_nce_loss=%.6f", total_nce.item())
-
+            neg_samples = self.sampler(
+                y_pred, num_samples=self.config.nce_samples, labels=labels
+            )
+            energy_neg = self.loss_net.energy.energy_neg_from_precomputed(
+                cache, neg_samples, marginals
+            )
         # InfoNCE or NCE
         if self.config.contrastive_loss == "infonce":
-            return self.contrastive_loss_fn(energy_gt, energy_neg) + e_reg
+            return self.contrastive_loss_fn(energy_gt, energy_neg)
 
         # NCE: compute log-prob
         if log_prob_gt is None:
@@ -610,7 +591,7 @@ class CRELTrainer:
                 neg_samples, y_pred.unsqueeze(1).expand_as(neg_samples)
             )
 
-        return self.contrastive_loss_fn(energy_gt, energy_neg, log_prob_gt, log_prob_neg) + e_reg
+        return self.contrastive_loss_fn(energy_gt, energy_neg, log_prob_gt, log_prob_neg)
 
     def _run_diagnostics(
         self,

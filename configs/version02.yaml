@@ -1,82 +1,75 @@
-# CREL: Default Configuration
-# ============================
+# CREL v02: Adversarial NCE with spectral-norm scale control
+# ==========================================================
+# Key changes from v01:
+#   - adversarial negatives (gradient ascent on energy for hard negatives)
+#   - lower infonce temperature (0.1 → amplifies energy gap)
+#   - moderate energy capacity (not oversized)
+#   - no explicit energy regularization (spectral norm handles scale)
 
 # Dataset
 dataset:
-  name: bibtex            # bibtex, delicious, genbase, cal500, eurlex_ev, expr_fun, spo_fun
+  name: bibtex
   data_dir: ./data
   num_workers: 4
 
 # Task Network
 task_net:
-  hidden_dims: [512, 512]
-  dropout: 0.3
+  hidden_dims: [768, 768]   # task_net_hidden_dim=768, n_layers=2
+  dropout: 0.219619615872438
   activation: relu
 
 # CREL Energy (Loss Network)
 energy:
-  type: crel               # crel or seal (for baseline comparison)
-  rank: 512                  # r: rank of low-rank precision factorization
-  label_embed_dim: 512       # d_e: label embedding dimension
-  proj_hidden_dim: 512       # d_h: projection MLP hidden dim
-  # Higher-order term
+  type: crel
+  rank: 32                   # r: from optuna
+  label_embed_dim: 64        # d_e
+  proj_hidden_dim: 64        # d_h: from optuna
   higher_order:
     enabled: true
-    proj_dim: 512            # r': projection dimension for centered predictions
-    hidden_dim: 512         # h': hidden dim of higher-order MLP
+    proj_dim: 64
+    hidden_dim: 128
 
-# Feature network (shared input encoder for loss-net)
+# Feature network
 feature_net:
-  hidden_dims: [512, 512]
-  dropout: 0.3
+  hidden_dims: [256, 256]    # feature_net_hidden_dim=256
+  dropout: 0.219619615872438
 
-# Training (alternating updates from step 1)
+# Training
 training:
-  # Optimization
   total_epochs: 100
   batch_size: 64
-  task_net_lr: 1.0e-3
-  loss_net_lr: 1.0e-3
+  task_net_lr: 0.0015456578698013592
+  loss_net_lr: 0.00978046497230848
   weight_decay: 1.0e-5
   optimizer: adamW
 
-  # Loss weights
-  lambda_energy: 1.0        # λ_1: weight on cooperative energy refinement loss
-  lambda_bce: 1.0           # λ_2: weight on BCE term
+  lambda_bce: 1.0
 
   # EMA centering
-  ema_beta: 0.99            # β: EMA coefficient for centering target
-  ema_warmup_beta: 0.9      # starting β during warmup (annealed to ema_beta)
-  ema_warmup_fraction: 0.05 # fraction of total steps for EMA beta annealing
+  ema_beta: 0.99
+  ema_warmup_beta: 0.9
+  ema_warmup_fraction: 0.05
 
   # Contrastive loss
-  contrastive_loss: infonce  # nce or infonce
-  infonce_temperature: 1.0   # temperature scaling (InfoNCE only)
-  nce_samples: 32           # K: number of negative samples
-  nce_sampling: bernoulli   # bernoulli or gaussian_noise
-  nce_gaussian_sigma: 0.3   # σ for gaussian_noise sampling
-  energy_reg: 0.01          # λ_reg: E² regularization on contrastive loss
+  contrastive_loss: infonce
+  infonce_temperature: 1.0   # moderate: 0.1 saturates InfoNCE to 0 (dead gradient)
+  nce_samples: 32
+  nce_sampling: corruption    # flip GT labels — keeps negatives binary so energy
+                              # can't cheat by detecting binary-vs-continuous
 
-  # Gradient clipping (both nets)
-  grad_clip: 10.0
+  grad_clip: 5.0
 
 # Diagnostics
 diagnostics:
-  log_interval: 50          # steps between diagnostic logging
-  gradient_cosine: true     # track gradient orthogonality (Diagnostic 1)
-  precision_alignment: true # track precision alignment (Diagnostic 2)
-  gradient_snr: true        # track gradient signal-to-noise (Diagnostic 3)
+  log_interval: 50
+  gradient_cosine: true
+  precision_alignment: true
+  gradient_snr: true
 
 # Logging
 logging:
-  backend: tensorboard      # tensorboard or wandb
+  backend: tensorboard
   log_dir: ./logs
-  experiment_name: crel_default
+  experiment_name: crel_v02
 
-# Pretrained checkpoint (optional)
-# When set to a SEAL best_model.pt path (e.g. from seal-neurips-2022), task_net and loss_net
-# are initialized from it. For bibtex, architecture is auto-set to [400, 400] / global_hidden_dim 200.
-# pretrained_path: null
-
-# Reproducibility
 seed: 42

@@ -4,10 +4,9 @@ Computes a low-rank quadratic energy over centered label predictions,
 optionally augmented with a higher-order softplus term.  The forward
 pass is O(L * r) -- the L x L coupling matrix is never materialized.
 
-Energy is scaled so its magnitude stays O(1) for any L: inside the
-quadratic, z is scaled by 1/L and the diagonal correction by 1/L^2
-so e_quad is O(1) (true L^2 normalization); the final energy is
-(e_quad + e_higher)/L and optionally clamped to [-1e6, 1e6].
+No explicit normalization by L is applied to the quadratic energy.
+Spectral normalization on all projection layers bounds the energy
+magnitude, and the cooperative dot-product loss is scale-invariant.
 
 All linear layers are spectrally normalized to bound the energy output
 magnitude, preventing NCE scale degeneracy.
@@ -196,15 +195,14 @@ class CRELEnergy(nn.Module):
         A = self._compute_label_embeddings(input_features)  # (batch, L, r)
 
         # Quadratic energy (O(Lr), never form L x L matrix)
-        # Scale z by 1/L and diag by 1/L^2 so e_quad is O(1) and does not overflow for large L.
-        L = self.num_labels
-        z = torch.einsum("blr,bl->br", A, y_bar) / L  # (batch, r)
+        # E_quad = -0.5 * ȳ^T (AA^T - diag(AA^T)) ȳ
+        z = torch.einsum("blr,bl->br", A, y_bar)  # (batch, r)
         z_sq = 0.5 * (z * z).sum(dim=-1)  # (batch,)
 
-        # Diagonal correction (scale by 1/L^2 to match quadratic)
+        # Diagonal correction
         a_sq = (A * A).sum(dim=-1)               # (batch, L)
         y_bar_sq = y_bar * y_bar                  # (batch, L)
-        diag_correction = (0.5 * (a_sq * y_bar_sq).sum(dim=-1)) / (L * L)  # (batch,)
+        diag_correction = 0.5 * (a_sq * y_bar_sq).sum(dim=-1)  # (batch,)
 
         e_quad = -z_sq + diag_correction  # (batch,)
 
@@ -219,8 +217,7 @@ class CRELEnergy(nn.Module):
                 y_pred.size(0), device=y_pred.device, dtype=y_pred.dtype
             )
 
-        energy = e_quad + e_higher  # (batch,)
-        energy = (energy / self.num_labels).clamp(-1e6, 1e6)
+        energy = (e_quad + e_higher).clamp(-1e6, 1e6)  # (batch,)
         return energy
 
     # ------------------------------------------------------------------
@@ -271,11 +268,10 @@ class CRELEnergy(nn.Module):
         a_sq = cache["a_sq"]
         y_bar = y_pred - y_marginals
 
-        L = self.num_labels
-        z = torch.einsum("blr,bl->br", A, y_bar) / L
+        z = torch.einsum("blr,bl->br", A, y_bar)
         z_sq = 0.5 * (z * z).sum(dim=-1)
         y_bar_sq = y_bar * y_bar
-        diag_correction = (0.5 * (a_sq * y_bar_sq).sum(dim=-1)) / (L * L)
+        diag_correction = 0.5 * (a_sq * y_bar_sq).sum(dim=-1)
         e_quad = -z_sq + diag_correction
 
         if self.higher_order:
@@ -288,8 +284,7 @@ class CRELEnergy(nn.Module):
                 y_pred.size(0), device=y_pred.device, dtype=y_pred.dtype
             )
 
-        return ((e_quad + e_higher) / self.num_labels).clamp(-1e6, 1e6)
-
+        return (e_quad + e_higher)
     def energy_neg_from_precomputed(
         self,
         cache: dict[str, torch.Tensor],
@@ -314,20 +309,19 @@ class CRELEnergy(nn.Module):
         a_sq = cache["a_sq"]  # (B, L)
         y_bar = neg_samples - y_marginals.unsqueeze(1)  # (B, K, L)
 
-        L = self.num_labels
-        # Quadratic: z_k = A^T y_bar_k, scaled by 1/L
-        z = torch.einsum("blr,bkl->bkr", A, y_bar) / L  # (B, K, r)
+        # Quadratic: z_k = A^T y_bar_k
+        z = torch.einsum("blr,bkl->bkr", A, y_bar)  # (B, K, r)
         z_sq = 0.5 * (z * z).sum(dim=-1)  # (B, K)
 
-        # Diagonal correction (scale by 1/L^2)
+        # Diagonal correction
         y_bar_sq = y_bar * y_bar  # (B, K, L)
-        diag_correction = (0.5 * torch.einsum("bl,bkl->bk", a_sq, y_bar_sq)) / (L * L)  # (B, K)
+        diag_correction = 0.5 * torch.einsum("bl,bkl->bk", a_sq, y_bar_sq)  # (B, K)
 
         e_quad = -z_sq + diag_correction  # (B, K)
 
         if self.higher_order:
-            B, K, L = neg_samples.shape
-            y_bar_flat = y_bar.reshape(B * K, L)
+            B, K, Ln = neg_samples.shape
+            y_bar_flat = y_bar.reshape(B * K, Ln)
             y_pooled = self.higher_proj(y_bar_flat)          # (B*K, r')
             f_pooled = cache["f_pooled"]                     # (B, r')
             f_expanded = f_pooled.unsqueeze(1).expand(B, K, -1).reshape(B * K, -1)
@@ -338,8 +332,7 @@ class CRELEnergy(nn.Module):
                 neg_samples.shape[:2], device=neg_samples.device, dtype=neg_samples.dtype
             )
 
-        return ((e_quad + e_higher) / self.num_labels).clamp(-1e6, 1e6)
-
+        return (e_quad + e_higher)
     # ------------------------------------------------------------------
     # Diagnostic helpers (NOT used during training)
     # ------------------------------------------------------------------
