@@ -1,7 +1,7 @@
 
 # Custom directories
 *.arff
-
+data/
 
 # Bytecode and cache
 __pycache__/
